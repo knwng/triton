@@ -3515,13 +3515,14 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
         tl.store(out_ptr, c.to(tl.bfloat16))
 
     @triton.jit
-    def mxfp_to_bf16_kernel(
+    def mxfp_upcast_kernel(
         x_ptr,
         scale_ptr,
         mxfp_ptr,
         N,
         e_bits: tl.constexpr,
         m_bits: tl.constexpr,
+        dst_type: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         # x.shape ==     (N, 32) for fp8 or (N, 16) for fp4
@@ -3543,41 +3544,54 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
         tl.static_assert(scale.dtype == tl.uint8)
         tl.static_assert(x.dtype == tl.uint8)
 
-        scale_bf16 = (scale.to(tl.uint16) << 7).to(tl.bfloat16, bitcast=True)
+        if dst_type == tl.bfloat16:
+            upcasted_scale = (scale.to(tl.uint16) << 7).to(tl.bfloat16, bitcast=True)
+        else:
+            tl.static_assert(dst_type == tl.float16)
+            scale_fp32 = (scale.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+            upcasted_scale = scale_fp32.to(tl.float16)
+
         if is_fp8:
             if e_bits == 5 and m_bits == 2:
                 x_f8 = x.to(tl.float8e5, bitcast=True)
-                x_bf16 = x_f8.to(tl.bfloat16)
+                upcasted_x = x_f8.to(dst_type)
                 # Preserve infs and nans. FIXME Fp8E5M2_to_Bf16 doesn't preserve them!
                 non_finite_mask: tl.constexpr = ((1 << e_bits) - 1) << m_bits
                 non_finite_mask_bf16: tl.constexpr = ((1 << 8) - 1) << 7
-                x_bf16 = tl.where(
+                non_finite_mask_fp16: tl.constexpr = ((1 << 5) - 1) << 10
+                mask_16bit : tl.constexpr = \
+                    non_finite_mask_bf16 if dst_type == tl.bfloat16 else non_finite_mask_fp16
+                upcasted_x = tl.where(
                     x & non_finite_mask == non_finite_mask,
-                    (x_bf16.to(tl.uint16, bitcast=True) | non_finite_mask_bf16).to(tl.bfloat16, bitcast=True),
-                    x_bf16,
+                    (upcasted_x.to(tl.uint16, bitcast=True) | mask_16bit).to(dst_type, bitcast=True),
+                    upcasted_x,
                 )
             else:
                 tl.static_assert(e_bits == 4 and m_bits == 3)
                 x_f8 = x.to(tl.float8e4nv, bitcast=True)
-                x_bf16 = x_f8.to(tl.bfloat16)
+                upcasted_x = x_f8.to(dst_type)
         else:
+            dst_e_bits : tl.constexpr = 8 if dst_type == tl.bfloat16 else 5
+            dst_m_bits : tl.constexpr = 7 if dst_type == tl.bfloat16 else 10
+            dst_bias : tl.constexpr = 127 if dst_type == tl.bfloat16 else 15
+            dst_point5 : tl.constexpr = 16128 if dst_type == tl.bfloat16 else 0x3800
             # e2m1
             em0 = x & 0x7
             em1 = x & 0x70
-            x0 = (em0.to(tl.uint16) << 2 + 4) | ((x & 0x8).to(tl.uint16) << 8 + 4)
-            x1 = (em1.to(tl.uint16) << 2) | ((x & 0x80).to(tl.uint16) << (8))
+            x0 = (em0.to(tl.uint16) << (dst_m_bits - 1)) | ((x & 0x8).to(tl.uint16) << 12)
+            x1 = (em1.to(tl.uint16) << (dst_m_bits - 1 - 4)) | ((x & 0x80).to(tl.uint16) << 8)
             # Three cases:
             # 1) x is normal and non-zero: Correct bias
-            x0 = tl.where((em0 & 0x6) != 0, x0 + ((127 - 1) << 7), x0)
-            x1 = tl.where((em1 & 0x60) != 0, x1 + ((127 - 1) << 7), x1)
+            x0 = tl.where((em0 & 0x6) != 0, x0 + ((dst_bias - 1) << dst_m_bits), x0)
+            x1 = tl.where((em1 & 0x60) != 0, x1 + ((dst_bias - 1) << dst_m_bits), x1)
             # 2) x is subnormal (x == 0bs001 where s is the sign): Map to +-0.5 in bf16
-            x0 = tl.where(em0 == 0x1, 16128 | (x0 & 0x8000), x0)
-            x1 = tl.where(em1 == 0x10, 16128 | (x1 & 0x8000), x1)
+            x0 = tl.where(em0 == 0x1, dst_point5 | (x0 & 0x8000), x0)
+            x1 = tl.where(em1 == 0x10, dst_point5 | (x1 & 0x8000), x1)
             # 3) x is zero, do nothing
-            x_bf16 = tl.interleave(x0, x1).to(tl.bfloat16, bitcast=True)
-        # Multiplication preserves infs and NaNs in x_bf16
-        mxfp = x_bf16 * scale_bf16
-        # If scale is NaN, we encode it as an bf16 inf, so we need to correct for that
+            upcasted_x = tl.interleave(x0, x1).to(dst_type, bitcast=True)
+        # Multiplication preserves infs and NaNs in upcasted_x
+        mxfp = upcasted_x * upcasted_scale
+        # If scale is NaN, we encode it as an inf, so we need to correct for that
         mxfp = tl.where(scale == 0xFF, float("nan"), mxfp)
 
         offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -3585,7 +3599,7 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
 
     def dot_scale_ref(x, scale_x, y, scale_y, type_x, type_y):
 
-        def upcast(v, scale, type, transposed):
+        def upcast(v, scale, type, dst_type, transposed):
             comp_dtype = torch.bfloat16
             if scale is None:
                 type = {
@@ -3604,15 +3618,18 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
             N = v_upcast.numel()
             BLOCK_SIZE = 512
             grid = ((N + BLOCK_SIZE - 1) // BLOCK_SIZE, )
-            mxfp_to_bf16_kernel[grid](v, scale, v_upcast, scale.numel(), e_bits, m_bits, BLOCK_SIZE,
-                                      num_warps=num_warps)
+            mxfp_upcast_kernel[grid](v, scale, v_upcast, scale.numel(), e_bits, m_bits,
+                                     dst_type, BLOCK_SIZE, num_warps=num_warps)
             assert v_upcast.isfinite().all()
             if transposed:
                 v_upcast = v_upcast.mT
             return v_upcast
 
-        x_upcast = upcast(x, scale_x, type_x, False)
-        y_upcast = upcast(y, scale_y, type_y, True)
+        # Upcast to fp16 if one of the input is fp16
+        dst_type = tl.float16 if "fp16" in (type_x, type_y) else tl.bfloat16
+
+        x_upcast = upcast(x, scale_x, type_x, dst_type, False)
+        y_upcast = upcast(y, scale_y, type_y, dst_type, True)
 
         class AccumulateInFp32:
 
@@ -3637,8 +3654,6 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
             ret.clamp_(-2**15, 2**15 - 1)
         elif ty == "fp16":
             ret = torch.randn(shape, dtype=torch.float16, device=device)
-            # Clamp to avoid relative error issues
-            ret.clamp_(-2**15, 2**15 - 1)
         else:
             ret = torch.randint(max_val + 1, shape, dtype=torch.uint8, device=device)
         if col_major:
@@ -3682,9 +3697,6 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
     z = x.new_empty((M, N), dtype=torch.float16 if normal_type == "fp16" else torch.bfloat16)
     pgm = dot_scale_kernel[(1, )](x, *x.stride(), scale_x, y, *y.stride(), scale_y, z, M, N, K, type_a, type_b,
                                   **kernel_kwargs)
-    # FIXME: update reference computation impl to verify correctness
-    if normal_type == "fp16":
-        return
     z_ref = dot_scale_ref(x, scale_x, y, scale_y, type_a, type_b)
     # Bigger tolerance for AMD MI200 devices.
     # MI200 devices use reduced precision fp16 and bf16 and flush input and output denormal values
