@@ -35,6 +35,50 @@ static MfmaTypeId chooseAppropriateMfmaId(mlir::Type dataTypeA,
   if (dataTypeA.isFloat8E5M2() && dataTypeB.isFloat8E5M2()) {
     return MfmaTypeId::Fp16TyId;
   }
+  // fp8/bf8 * fp6/bf6
+  if (dataTypeA.isFloat8E4M3FNUZ() && dataTypeB.isFloat6E3M2FN()) {
+    return MfmaTypeId::Fp8Fp6TyId;
+  }
+  if (dataTypeA.isFloat8E4M3FNUZ() && dataTypeB.isFloat6E2M3FN()) {
+    return MfmaTypeId::Fp8Bf6TyId;
+  }
+  if (dataTypeA.isFloat8E5M2FNUZ() && dataTypeB.isFloat6E3M2FN()) {
+    return MfmaTypeId::Bf8Fp6TyId;
+  }
+  if (dataTypeA.isFloat8E5M2FNUZ() && dataTypeB.isFloat6E2M3FN()) {
+    return MfmaTypeId::Bf8Bf6TyId;
+  }
+  // fp8/bf8 * fp4
+  if (dataTypeA.isFloat8E4M3FNUZ() && dataTypeB.isFloat4E2M1FN()) {
+    return MfmaTypeId::Fp8Fp4TyId;
+  }
+  if (dataTypeA.isFloat8E5M2FNUZ() && dataTypeB.isFloat4E2M1FN()) {
+    return MfmaTypeId::Bf8Fp4TyId;
+  }
+  // fp6 * bf6
+  if (dataTypeA.isFloat6E3M2FN() && dataTypeB.isFloat6E3M2FN()) {
+    return MfmaTypeId::Fp6Fp6TyId;
+  }
+  if (dataTypeA.isFloat6E3M2FN() && dataTypeB.isFloat6E2M3FN()) {
+    return MfmaTypeId::Fp6Bf6TyId;
+  }
+  if (dataTypeA.isFloat6E2M3FN() && dataTypeB.isFloat6E3M2FN()) {
+    return MfmaTypeId::Bf6Fp6TyId;
+  }
+  if (dataTypeA.isFloat6E2M3FN() && dataTypeB.isFloat6E2M3FN()) {
+    return MfmaTypeId::Bf6Bf6TyId;
+  }
+  // fp6/bf6 * fp4
+  if (dataTypeA.isFloat6E3M2FN() && dataTypeB.isFloat4E2M1FN()) {
+    return MfmaTypeId::Fp6Fp4TyId;
+  }
+  if (dataTypeA.isFloat6E2M3FN() && dataTypeB.isFloat4E2M1FN()) {
+    return MfmaTypeId::Bf6Fp4TyId;
+  }
+  // fp4
+  if (dataTypeA.isFloat4E2M1FN() && dataTypeB.isFloat4E2M1FN()) {
+    return MfmaTypeId::Fp4Fp4TyId;
+  }
   llvm_unreachable("Unsupported input argument type.");
 }
 
@@ -216,7 +260,36 @@ auto getMfmaInsnGroupAttrMap = []() -> const MfmaInsnGroupMap & {
        {32, 32, 16, 8, ROCDL::mfma_f32_32x32x16_bf8_bf8::getOperationName()}},
       // mfma_f32_16x16x32_BF8_BF8
       {{16, 16, MfmaTypeId::Bf8Bf8TyId, 3},
-       {16, 16, 32, 8, ROCDL::mfma_f32_16x16x32_bf8_bf8::getOperationName()}}};
+       {16, 16, 32, 8, ROCDL::mfma_f32_16x16x32_bf8_bf8::getOperationName()}},
+      // fp8/bf8 * fp6/bf6
+      // mfma_f32_16x16x128_f8f6f4
+      {{16, 16, MfmaTypeId::Fp8Fp6TyId, 3},
+       {16, 16, 128, 8, ROCDL::mfma_f32_16x16x128_f8f6f4::getOperationName()}},
+      {{16, 16, MfmaTypeId::Fp8Bf6TyId, 3},
+       {16, 16, 128, 8, ROCDL::mfma_f32_16x16x128_f8f6f4::getOperationName()}},
+      {{16, 16, MfmaTypeId::Bf8Fp6TyId, 3},
+       {16, 16, 128, 8, ROCDL::mfma_f32_16x16x128_f8f6f4::getOperationName()}},
+      {{16, 16, MfmaTypeId::Bf8Bf6TyId, 3},
+       {16, 16, 128, 8, ROCDL::mfma_f32_16x16x128_f8f6f4::getOperationName()}},
+      // mfma_scale_f32_16x16x128_f8f6f4
+      {{16, 16, MfmaTypeId::Fp8Fp6TyId, 3},
+       {16, 16, 128, 8,
+        ROCDL::mfma_scale_f32_16x16x128_f8f6f4::getOperationName()}},
+      {{16, 16, MfmaTypeId::Fp8Bf6TyId, 3},
+       {16, 16, 128, 8,
+        ROCDL::mfma_scale_f32_16x16x128_f8f6f4::getOperationName()}},
+      {{16, 16, MfmaTypeId::Bf8Fp6TyId, 3},
+       {16, 16, 128, 8,
+        ROCDL::mfma_scale_f32_16x16x128_f8f6f4::getOperationName()}},
+      {{16, 16, MfmaTypeId::Bf8Bf6TyId, 3},
+       {16, 16, 128, 8,
+        ROCDL::mfma_scale_f32_16x16x128_f8f6f4::getOperationName()}},
+      // mfma_f32_32x32x64_f8f6f4
+      {{32, 32, MfmaTypeId::Fp8Fp6TyId, 3},
+       {32, 32, 64, 8, ROCDL::mfma_f32_32x32x64_f8f6f4::getOperationName()}},
+      // mfma_scale_f32_32x32x64_f8f6f4
+
+  };
   return MfmaInsnMap;
 };
 
@@ -229,6 +302,9 @@ std::pair<mlir::Type, mlir::Type> TypesFromMfmaId(mlir::MLIRContext *ctx,
   auto bf16 = BFloat16Type::get(ctx);
   auto f32 = Float32Type::get(ctx);
   auto i8 = IntegerType::get(ctx, 8, IntegerType::Signed);
+  auto f6e3m2fn = Float6E3M2FNType::get(ctx);
+  auto f6e2m3fn = Float6E2M3FNType::get(ctx);
+  auto f4e2m1fn = Float4E2M1FNType::get(ctx);
   switch (id) {
   case MfmaTypeId::Xf32TyId:
   case MfmaTypeId::Fp32TyId:
@@ -247,6 +323,32 @@ std::pair<mlir::Type, mlir::Type> TypesFromMfmaId(mlir::MLIRContext *ctx,
     return {f8e5m2fnuz, f8e4m3fnuz};
   case MfmaTypeId::Bf8Bf8TyId:
     return {f8e5m2fnuz, f8e5m2fnuz};
+  case MfmaTypeId::Fp8Fp6TyId:
+    return {f8e4m3fnuz, f6e3m2fn};
+  case MfmaTypeId::Fp8Bf6TyId:
+    return {f8e4m3fnuz, f6e2m3fn};
+  case MfmaTypeId::Bf8Fp6TyId:
+    return {f8e5m2fnuz, f6e3m2fn};
+  case MfmaTypeId::Bf8Bf6TyId:
+    return {f8e5m2fnuz, f6e2m3fn};
+  case MfmaTypeId::Fp8Fp4TyId:
+    return {f8e4m3fnuz, f4e2m1fn};
+  case MfmaTypeId::Bf8Fp4TyId:
+    return {f8e5m2fnuz, f4e2m1fn};
+  case MfmaTypeId::Fp6Fp6TyId:
+    return {f6e3m2fn, f6e3m2fn};
+  case MfmaTypeId::Fp6Bf6TyId:
+    return {f6e3m2fn, f6e2m3fn};
+  case MfmaTypeId::Bf6Fp6TyId:
+    return {f6e2m3fn, f6e3m2fn};
+  case MfmaTypeId::Bf6Bf6TyId:
+    return {f6e2m3fn, f6e2m3fn};
+  case MfmaTypeId::Fp6Fp4TyId:
+    return {f6e3m2fn, f4e2m1fn};
+  case MfmaTypeId::Bf6Fp4TyId:
+    return {f6e2m3fn, f4e2m1fn};
+  case MfmaTypeId::Fp4Fp4TyId:
+    return {f4e2m1fn, f4e2m1fn};
   default:
     llvm_unreachable("unsupported MfmaTypeId!");
   }
