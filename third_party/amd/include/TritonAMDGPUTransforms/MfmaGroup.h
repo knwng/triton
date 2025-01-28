@@ -17,29 +17,11 @@ enum class MfmaTypeId : uint32_t {
   Fp16TyId,
   Bf16TyId,
   I8TyId,
-  // fp8 * bf8
   Fp8Fp8TyId,
   Fp8Bf8TyId,
   Bf8Fp8TyId,
   Bf8Bf8TyId,
-  // fp8/bf8 * fp6/bf6
-  Fp8Fp6TyId,
-  Fp8Bf6TyId,
-  Bf8Fp6TyId,
-  Bf8Bf6TyId,
-  // fp8/bf8 * fp4
-  Fp8Fp4TyId,
-  Bf8Fp4TyId,
-  // fp6 * bf6
-  Fp6Fp6TyId,
-  Fp6Bf6TyId,
-  Bf6Fp6TyId,
-  Bf6Bf6TyId,
-  // fp6/bf6 * fp4
-  Fp6Fp4TyId,
-  Bf6Fp4TyId,
-  // fp4
-  Fp4Fp4TyId
+  F8F6F4TyId,
 };
 
 struct MfmaInsnGroupSelectKey {
