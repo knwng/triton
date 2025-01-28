@@ -26,7 +26,8 @@ using namespace mlir;
 // implementation.
 
 namespace mlir::triton {
-void setNumGeneratedMMAs(DotOp op, size_t mmaCount, unsigned m, unsigned n,
+template <typename DotOpType>
+void setNumGeneratedMMAs(DotOpType op, size_t mmaCount, unsigned m, unsigned n,
                          unsigned k, Type elementType) {
   auto *ctx = op->getContext();
   auto mmaType = RankedTensorType::get({m, n, k}, elementType);
