@@ -39,6 +39,12 @@ void setNumGeneratedMMAs(DotOpType op, size_t mmaCount, unsigned m, unsigned n,
   });
 }
 
+template void setNumGeneratedMMAs(triton::DotOp op, size_t mmaCount, unsigned m,
+                                  unsigned n, unsigned k, Type elementType);
+template void setNumGeneratedMMAs(triton::DotScaledOp op, size_t mmaCount,
+                                  unsigned m, unsigned n, unsigned k,
+                                  Type elementType);
+
 template <typename LoadOpType>
 void setNumGeneratedGlobalLoads(LoadOpType op, size_t globalLoadsCount,
                                 Type type) {

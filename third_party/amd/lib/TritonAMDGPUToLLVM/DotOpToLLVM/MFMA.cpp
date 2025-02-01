@@ -31,6 +31,7 @@ using namespace mlir::triton;
 
 namespace {
 
+using ::mlir::LLVM::AMD::scaleDotElemTypeToMLIRType;
 using ::mlir::LLVM::AMD::shuffleXor;
 using ::mlir::triton::gpu::AMDMfmaEncodingAttr;
 using ::mlir::triton::gpu::DotOperandEncodingAttr;
@@ -48,19 +49,19 @@ using ValueTable = std::map<std::array<int, 3>, Value>;
 /// - 3: E3M2(BF6)
 /// - 4: E2M1(FP4)
 static inline int32_t getMfmaF8F6F4MatrixFormat(mlir::Type t) {
-  if (t.isFloat8E4M3FNUZ()) {
+  if (llvm::isa<Float8E4M3FNUZType>(t)) {
     return 0;
   }
-  if (t.isFloat8E5M2FNUZ()) {
+  if (llvm::isa<Float8E5M2FNUZType>(t)) {
     return 1;
   }
-  if (t.isFloat6E3M2FN()) {
+  if (llvm::isa<Float6E3M2FNType>(t)) {
     return 2;
   }
-  if (t.isFloat6E2M3FN()) {
+  if (llvm::isa<Float6E2M3FNType>(t)) {
     return 3;
   }
-  if (t.isFloat4E2M1FN()) {
+  if (llvm::isa<Float4E2M1FNType>(t)) {
     return 4;
   }
   return -1;
@@ -373,8 +374,8 @@ struct DotOpMFMAConversionHelper {
   /// Extract vector from rawElems based on kWidth and kBase
   /// rawElems is a vector of kWidth elements. We need to prepare vector(s) of
   /// kBase elements for each mfma instruction
-  SmallVector<Value> extractOperands(Value rawElems, int kWidth, int kBase,
-                                     Type type) const {
+  virtual SmallVector<Value> extractOperands(Value rawElems, int kWidth,
+                                             int kBase, Type type) const {
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     int kpack = kWidth / kBase;
     SmallVector<Value> results;
@@ -415,6 +416,9 @@ struct DotOpMFMAConversionHelper {
                                       bool allowXF32) const {
     auto tb = TritonLLVMOpBuilder(loc, rewriter);
     auto elems = unpackLLElements(loc, value, rewriter);
+    llvm::outs() << "elems.size(): " << elems.size() << " kWidth: " << kWidth
+                 << " kBase: " << kBase << " batch: " << batch << " n0: " << n0
+                 << " n1: " << n1 << "\n";
     int kpack = kWidth / kBase;
     SmallVector<ValueTable> dotOpVals(kpack);
     for (int b = 0; b < batch; ++b) {
@@ -424,6 +428,8 @@ struct DotOpMFMAConversionHelper {
           Type ty = vec_ty(elemTy, kWidth);
           Value rawElems = tb.undef(ty);
           for (int k = 0; k < kWidth; ++k) {
+            auto idx = kWidth * n1 * n0 * b + kWidth * n1 * i + kWidth * j + k;
+            llvm::outs() << "idx: " << idx << "\n";
             rawElems = tb.insert_element(
                 ty, rawElems,
                 elems[kWidth * n1 * n0 * b + kWidth * n1 * i + kWidth * j + k],
@@ -483,6 +489,9 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
 
   LogicalResult convertScaledDot(DotScaledOp op,
                                  DotScaledOpAdaptor adaptor) const {
+    llvm::outs()
+        << op.getLoc()
+        << " ScaledDotOpMFMAConversionHelper::convertScaledDot start\n";
     // Check if this dot has come with priority set by setprio.
     auto setPrioOp = dyn_cast_or_null<ROCDL::SetPrioOp>(op->getPrevNode());
 
@@ -503,18 +512,33 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     auto dTensorTy = cast<RankedTensorType>(d.getType());
     auto elemTyA = aTensorTy.getElementType();
     auto elemTyB = bTensorTy.getElementType();
+    ScaleDotElemType aElemType = op.getLhsType();
+    ScaleDotElemType bElemType = op.getRhsType();
 
-    if (!elemTyA.isFloat4E2M1FN() || !elemTyB.isFloat4E2M1FN())
+    // llvm::outs() << op.getLoc()
+    //              << " ScaledDotOpMFMAConversionHelper::convertScaledDot"
+    //              << " elemTyA: " << elemTyA << " elemTyB: " << elemTyB
+    //              << " aElemType: " << aElemType << " bElemType: " <<
+    //              bElemType
+    //              << " mfmaVersion: " << mfmaVersion << "\n";
+    if (aElemType != ScaleDotElemType::E2M1 ||
+        bElemType != ScaleDotElemType::E2M1) {
       llvm::report_fatal_error("NYI: mxfp6, mxfp8\n");
+    }
 
-    StringRef mfmaInsnName;
-    auto maybeMfmaInsn =
-        MfmaInsn::selectMfma(mDim, nDim, elemTyA, elemTyB, mfmaVersion);
+    constexpr bool allowXF32 = false;
+    auto ctx = op.getContext();
+    auto maybeMfmaInsn = MfmaInsn::selectMfma(
+        mDim, nDim, scaleDotElemTypeToMLIRType(ctx, aElemType),
+        scaleDotElemTypeToMLIRType(ctx, bElemType), mfmaVersion, allowXF32);
     if (failed(maybeMfmaInsn))
       llvm::report_fatal_error("No match found in MFMA database\n");
 
-    mfmaInsnName = maybeMfmaInsn->getInsnName();
+    StringRef mfmaInsnName = maybeMfmaInsn->getInsnName();
     unsigned kBase = maybeMfmaInsn->getKBase();
+    if (aElemType == ScaleDotElemType::E2M1) {
+      kBase /= 2;
+    }
 
     auto aEncoding = cast<DotOperandEncodingAttr>(aTensorTy.getEncoding());
     auto bEncoding = cast<DotOperandEncodingAttr>(bTensorTy.getEncoding());
@@ -533,11 +557,49 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
         cast<DotOperandEncodingAttr>(aScaleTensorTy.getEncoding());
     auto bScaleEncoding =
         cast<DotOperandEncodingAttr>(bScaleTensorTy.getEncoding());
-    int kWidthScale = aScaleEncoding.getKWidth();
-    auto repAScale =
-        mfmaLayout.getRepForOperand(aScaleTensorTy.getShape(), kWidthScale, 0);
+    auto repAScale = mfmaLayout.getRepForOperand(aScaleTensorTy.getShape(),
+                                                 aScaleEncoding.getKWidth(), 0);
+    auto bScaleShape = bScaleTensorTy.getShape();
     auto repBScale =
-        mfmaLayout.getRepForOperand(bScaleTensorTy.getShape(), kWidthScale, 0);
+        mfmaLayout.getRepForOperand(bScaleShape, bScaleEncoding.getKWidth(), 1);
+    // assert(bScaleShape.size() == 2);
+    // SmallVector<int64_t> bScaleShapeT = {bScaleShape[1], bScaleShape[0]};
+    // auto repBScaleT = mfmaLayout.getRepForOperand(
+    //     bScaleShapeT, bScaleEncoding.getKWidth(), 1);
+    // SmallVector<int64_t> repBScale = {repBScaleT[0], repBScaleT[2],
+    //                                   repBScaleT[1]};
+
+    auto aScaleShape = aScaleTensorTy.getShape();
+    auto aScaleInstrShape =
+        mfmaLayout.getInstrShapeForOperand(aScaleEncoding.getKWidth(), 0);
+    auto bScaleInstrShape =
+        mfmaLayout.getInstrShapeForOperand(bScaleEncoding.getKWidth(), 1);
+    llvm::outs() << op.getLoc()
+                 << " ScaledDotOpMFMAConversionHelper::convertScaledDot"
+                 << " aScaleEncoding.getKWidth(): "
+                 << aScaleEncoding.getKWidth()
+                 << " bScaleEncoding.getKWidth(): "
+                 << bScaleEncoding.getKWidth()
+                 << " aScaleInstrShape[0]: " << aScaleInstrShape[0]
+                 << " aScaleInstrShape[1]: " << aScaleInstrShape[1]
+                 << " bScaleInstrShape[0]: " << bScaleInstrShape[0]
+                 << " bScaleInstrShape[1]: " << bScaleInstrShape[1]
+                 << " warpsPerCTA[0]: " << warpsPerCTA[0]
+                 << " warpsPerCTA[1]: " << warpsPerCTA[1]
+                 << " aScaleShape[0]: " << aScaleShape[0]
+                 << " aScaleShape[1]: " << aScaleShape[1]
+                 << " bScaleShape[0]: " << bScaleShape[0]
+                 << " bScaleShape[1]: " << bScaleShape[1]
+                 << " repA[0]: " << repA[0] << " repA[1]: " << repA[1]
+                 << " repA[2]: " << repA[2] << " repB[0]: " << repB[0]
+                 << " repB[1]: " << repB[1] << " repB[2]: " << repB[2]
+                 << " repAScale[0]: " << repAScale[0]
+                 << " repAScale[1]: " << repAScale[1]
+                 << " repAScale[2]: " << repAScale[2]
+                 << " repBScale[0]: " << repBScale[0]
+                 << " repBScale[1]: " << repBScale[1]
+                 << " repBScale[2]: " << repBScale[2] << "\n";
+
     assert(repAScale[2] == repBScale[1]);
 
     Value loadedA = adaptor.getLhs();
@@ -554,17 +616,45 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
 
     auto operandA = getValuesFromDotOperandLayoutStruct(
         loadedA, numRepB, numRepM, numRepK, kWidth, kBase,
-        aTensorTy.getElementType());
+        aTensorTy.getElementType(), allowXF32);
     auto operandB = getValuesFromDotOperandLayoutStruct(
         loadedB, numRepB, numRepN, numRepK, kWidth, kBase,
-        aTensorTy.getElementType());
+        bTensorTy.getElementType(), allowXF32);
 
+    auto numRepScaleM = repAScale[1];
+    auto numRepScaleN = repBScale[2];
+    auto numRepScaleK = repAScale[2];
+    auto numRepScaleB = repAScale[0];
+    assert(repAScale[0] == repBScale[0]);
+
+    constexpr int kBaseScale = 1;
     auto operandAScale = getValuesFromDotOperandLayoutStruct(
-        loadedAScale, repAScale[0], repAScale[1], repAScale[2], kWidthScale,
-        /*kBase=*/1, aScaleTensorTy.getElementType());
+        loadedAScale, numRepScaleB, numRepScaleM, numRepScaleK,
+        aScaleEncoding.getKWidth(), kBaseScale, aScaleTensorTy.getElementType(),
+        allowXF32);
     auto operandBScale = getValuesFromDotOperandLayoutStruct(
-        loadedBScale, numRepB, repBScale[2], repAScale[2], kWidthScale,
-        /*kBase=*/1, aScaleTensorTy.getElementType());
+        loadedBScale, numRepScaleB, numRepScaleN, numRepScaleK,
+        bScaleEncoding.getKWidth(), kBaseScale, bScaleTensorTy.getElementType(),
+        allowXF32);
+
+    llvm::outs() << " operandA.size(): " << operandA.size()
+                 << " operandB.size(): " << operandB.size()
+                 << " operandAScale.size(): " << operandAScale.size()
+                 << " operandBScale.size(): " << operandBScale.size()
+                 << " loadedAScale.shape(): " << loadedAScale.getType()
+                 << " loadedBScale.shape(): " << loadedBScale.getType() << "\n";
+
+    auto printOperand = [](std::string n, SmallVector<ValueTable> &v) {
+      llvm::outs() << n << ": ";
+      for (size_t i = 0; i < v.size(); i++) {
+        llvm::outs() << "(" << i << ", " << v[i].size() << ")";
+      }
+      llvm::outs() << "\n";
+    };
+    printOperand("operandA", operandA);
+    printOperand("operandB", operandB);
+    printOperand("operandAScale", operandAScale);
+    printOperand("operandBScale", operandBScale);
 
     auto dstElemTy = dTensorTy.getElementType();
     auto fc = unpackLLElements(loc, loadedC, rewriter);
@@ -680,6 +770,45 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
 
     return success();
   }
+
+  /// Extract vector from rawElems based on kWidth and kBase
+  /// rawElems is a vector of kWidth elements. We need to prepare vector(s) of
+  /// kBase elements for each mfma instruction
+  SmallVector<Value> extractOperands(Value rawElems, int kWidth, int kBase,
+                                     Type type) const {
+    int kpack = kWidth / kBase;
+    SmallVector<Value> results;
+    auto vecTy = vec_ty(type, kBase);
+    if (type.isBF16())
+      vecTy = vec_ty(i16_ty, kBase);
+    for (int k = 0; k < kpack; ++k) {
+      Value vec = undef(vecTy);
+      for (int elemId = 0; elemId < kBase; ++elemId) {
+        auto val = extract_element(type, rawElems, i32_val(elemId + k * kBase));
+        if (type.isBF16()) {
+          // rocdl.mfma.f32.32x32x8bf16.1k calls for input of i16 type
+          auto cast = bitcast(val, i16_ty);
+          vec = insert_element(vecTy, vec, cast, i32_val(elemId));
+        } else {
+          vec = insert_element(vecTy, vec, val, i32_val(elemId));
+        }
+      }
+      if (type.getIntOrFloatBitWidth() == 8) {
+        if (1 == kBase)
+          results.push_back(zext(i32_ty, bitcast(vec, i8_ty)));
+        if (4 == kBase)
+          // This is for int8 on pre- MI300 GPUs
+          results.push_back(bitcast(vec, i32_ty));
+        if (8 == kBase)
+          results.push_back(bitcast(vec, i64_ty));
+        if (16 == kBase)
+          results.push_back(bitcast(vec, vec_ty(i32_ty, 4)));
+      } else {
+        results.push_back(vec);
+      }
+    }
+    return results;
+  }
 };
 
 } // namespace
@@ -718,6 +847,7 @@ LogicalResult convertScaledMFMA(triton::DotScaledOp op,
                                 triton::DotScaledOp::Adaptor adaptor,
                                 const LLVMTypeConverter *typeConverter,
                                 ConversionPatternRewriter &rewriter) {
+  llvm::outs() << op.getLoc() << " convertScaledMFMA start\n";
   auto rankedTType = [](Value tensor) {
     return cast<RankedTensorType>(tensor.getType());
   };

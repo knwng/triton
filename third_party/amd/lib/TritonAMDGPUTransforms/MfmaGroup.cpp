@@ -3,8 +3,8 @@
 namespace mlir {
 
 static bool isF8F6F4(mlir::Type t) {
-  return t.isFloat8E4M3FNUZ() || t.isFloat8E5M2FNUZ() || t.isFloat6E3M2FN() ||
-         t.isFloat6E2M3FN() || t.isFloat4E2M1FN();
+  return llvm::isa<Float8E4M3FNUZType, Float8E5M2FNUZType, Float6E3M2FNType,
+                   Float6E2M3FNType, Float4E2M1FNType>(t);
 }
 
 static MfmaTypeId chooseAppropriateMfmaId(mlir::Type dataTypeA,
@@ -280,20 +280,24 @@ FailureOr<MfmaInsn> MfmaInsn::selectMfma(unsigned mDim, unsigned nDim,
                                          Type elementTypeA, Type elementTypeB,
                                          int mfmaVersion, bool allowXF32) {
   auto mfmaInsnAttrMap = getMfmaInsnGroupAttrMap();
-  MfmaTypeId mfmaId =
-      chooseAppropriateMfmaId(elementTypeA, elementTypeB, allowXF32);
+  MfmaTypeId mfmaId;
+  if (mfmaVersion == 4) {
+    // For mfma version 4, we only use the new f8f6f4 instructions
+    mfmaId = MfmaTypeId::F8F6F4TyId;
+  } else {
+    mfmaId = chooseAppropriateMfmaId(elementTypeA, elementTypeB, allowXF32);
+  }
   MfmaInsnGroupSelectKey key = {mDim, nDim, mfmaId, mfmaVersion};
   auto it = mfmaInsnAttrMap.find(key);
   if (it == mfmaInsnAttrMap.end())
     return failure();
-  return MfmaInsn(elementTypeA, elementTypeB, it->second);
-  // if (mfmaId == MfmaTypeId::F8F6F4TyId) {
-  //   return MfmaInsn(elementTypeA, elementTypeB, it->second);
-  // } else {
-  //   auto [instrElementTypeA, instrElementTypeB] =
-  //       TypesFromMfmaId(elementTypeA.getContext(), mfmaId);
-  //   return MfmaInsn(instrElementTypeA, instrElementTypeB, it->second);
-  // }
+  if (mfmaId == MfmaTypeId::F8F6F4TyId) {
+    return MfmaInsn(elementTypeA, elementTypeB, it->second);
+  } else {
+    auto [instrElementTypeA, instrElementTypeB] =
+        TypesFromMfmaId(elementTypeA.getContext(), mfmaId);
+    return MfmaInsn(instrElementTypeA, instrElementTypeB, it->second);
+  }
 }
 
 MfmaInsn::MfmaInsn(Type elementTypeA, Type elementTypeB,

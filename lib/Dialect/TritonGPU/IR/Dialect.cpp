@@ -970,8 +970,44 @@ unsigned DotOperandEncodingAttr::getTotalElemsPerThread(ArrayRef<int64_t> shape,
       return product<unsigned>(getElemsPerThread(shape, eltTy));
     }
     if (auto amdMfmaParent = mlir::dyn_cast<AMDMfmaEncodingAttr>(getParent())) {
-      return amdMfmaParent.getTotalElemsPerThreadForOperand(
+      // llvm::outs() << "DotOperandEncodingAttr::getTotalElemsPerThread";
+      // if (getIsScale()) {
+      //   auto rank = shape.size();
+      //   SmallVector<int64_t> shapeT;
+      //   auto idx = getOpIdx();
+      //   if (rank == 3) {
+      //     llvm::outs() << " shape[0]: " << shape[0] << " shape[1]: " <<
+      //     shape[1]
+      //                  << " shape[2]: " << shape[2];
+      //     if (idx == 0) {
+      //       shapeT = {shape[0], shape[1], shape[2] * 32};
+      //     } else {
+      //       assert(idx == 1);
+      //       shapeT = {shape[0], shape[2] * 32, shape[1]};
+      //     }
+      //   } else {
+      //     llvm::outs() << " shape[0]: " << shape[0]
+      //                  << " shape[1]: " << shape[1];
+      //     if (idx == 0) {
+      //       shapeT = {shape[0], shape[1] * 32};
+      //     } else {
+      //       assert(idx == 1);
+      //       shapeT = {shape[1] * 32, shape[0]};
+      //     }
+      //   }
+      //   auto ret = amdMfmaParent.getTotalElemsPerThreadForOperand(
+      //                  shapeT, eltTy, getKWidth(), getOpIdx()) /
+      //              32;
+      //   llvm::outs() << " ret: " << ret << "\n";
+      //   return ret;
+      // } else {
+      auto ret = amdMfmaParent.getTotalElemsPerThreadForOperand(
           shape, eltTy, getKWidth(), getOpIdx());
+      llvm::outs() << "DotOperandEncodingAttr::getTotalElemsPerThread ret: "
+                   << ret << " shape[0]: " << shape[0]
+                   << " shape[1]: " << shape[1] << "\n";
+      return ret;
+      // }
     }
     if (auto amdWmmaParent = mlir::dyn_cast<AMDWmmaEncodingAttr>(getParent())) {
       return amdWmmaParent.getTotalElemsPerThreadForOperand(
@@ -1707,8 +1743,8 @@ AMDMfmaEncodingAttr::verify(function_ref<mlir::InFlightDiagnostic()> emitError,
                             llvm::ArrayRef<unsigned int> warpsPerCTA,
                             unsigned mDim, unsigned nDim, bool isTransposed,
                             mlir::triton::gpu::CTALayoutAttr) {
-  if (!(versionMajor >= 0 && versionMajor <= 3)) {
-    return emitError() << "major version must be in the [0, 3] range";
+  if (!(versionMajor >= 0 && versionMajor <= 4)) {
+    return emitError() << "major version must be in the [0, 4] range";
   }
   if (versionMinor != 0) {
     return emitError() << "minor version must be 0";
