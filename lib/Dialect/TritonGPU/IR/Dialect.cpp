@@ -970,44 +970,12 @@ unsigned DotOperandEncodingAttr::getTotalElemsPerThread(ArrayRef<int64_t> shape,
       return product<unsigned>(getElemsPerThread(shape, eltTy));
     }
     if (auto amdMfmaParent = mlir::dyn_cast<AMDMfmaEncodingAttr>(getParent())) {
-      // llvm::outs() << "DotOperandEncodingAttr::getTotalElemsPerThread";
-      // if (getIsScale()) {
-      //   auto rank = shape.size();
-      //   SmallVector<int64_t> shapeT;
-      //   auto idx = getOpIdx();
-      //   if (rank == 3) {
-      //     llvm::outs() << " shape[0]: " << shape[0] << " shape[1]: " <<
-      //     shape[1]
-      //                  << " shape[2]: " << shape[2];
-      //     if (idx == 0) {
-      //       shapeT = {shape[0], shape[1], shape[2] * 32};
-      //     } else {
-      //       assert(idx == 1);
-      //       shapeT = {shape[0], shape[2] * 32, shape[1]};
-      //     }
-      //   } else {
-      //     llvm::outs() << " shape[0]: " << shape[0]
-      //                  << " shape[1]: " << shape[1];
-      //     if (idx == 0) {
-      //       shapeT = {shape[0], shape[1] * 32};
-      //     } else {
-      //       assert(idx == 1);
-      //       shapeT = {shape[1] * 32, shape[0]};
-      //     }
-      //   }
-      //   auto ret = amdMfmaParent.getTotalElemsPerThreadForOperand(
-      //                  shapeT, eltTy, getKWidth(), getOpIdx()) /
-      //              32;
-      //   llvm::outs() << " ret: " << ret << "\n";
-      //   return ret;
-      // } else {
       auto ret = amdMfmaParent.getTotalElemsPerThreadForOperand(
           shape, eltTy, getKWidth(), getOpIdx());
       llvm::outs() << "DotOperandEncodingAttr::getTotalElemsPerThread ret: "
                    << ret << " shape[0]: " << shape[0]
                    << " shape[1]: " << shape[1] << "\n";
       return ret;
-      // }
     }
     if (auto amdWmmaParent = mlir::dyn_cast<AMDWmmaEncodingAttr>(getParent())) {
       return amdWmmaParent.getTotalElemsPerThreadForOperand(
@@ -1072,8 +1040,18 @@ SmallVector<unsigned> DotOperandEncodingAttr::getWarpOrder() const {
   return {};
 }
 SmallVector<unsigned> DotOperandEncodingAttr::getThreadOrder() const {
-  return getOrderForDotOperand(getOpIdx(), getWarpsPerCTA().size(),
-                               /*kContig*/ true);
+  auto ret = getOrderForDotOperand(getOpIdx(), getWarpsPerCTA().size(),
+                                   /*kContig*/ true);
+  llvm::outs() << "DotOperandEncodingAttr::getThreadOrder, opIdx: "
+               << getOpIdx() << ", rank: " << getWarpsPerCTA().size()
+               << ", kWidth: " << getKWidth() << ", ret: (";
+  if (ret.size() == 3) {
+    llvm::outs() << ret[0] << ", " << ret[1] << ", " << ret[2];
+  } else {
+    llvm::outs() << ret[0] << ", " << ret[1];
+  }
+  llvm::outs() << ")\n";
+  return ret;
 }
 
 LogicalResult DotOperandEncodingAttr::verify(

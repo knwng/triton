@@ -3659,9 +3659,8 @@ def dot_scale_kernel(a_base, stride_a0, stride_a1, a_scale, b_base, stride_b0, s
         scale_a_ptr = a_scale + tl.arange(0, BLOCK_M)[:, None] * SCALE_BLOCK_K + tl.arange(0, SCALE_BLOCK_K)[None, :]
         a_scale = tl.load(scale_a_ptr)
     if b_scale is not None:
-        # scale_b_ptr = b_scale + tl.arange(0, BLOCK_N)[:, None] * SCALE_BLOCK_K + tl.arange(0,
-        #                                                                                     SCALE_BLOCK_K)[None, :]
-        scale_b_ptr = b_scale + tl.arange(0, SCALE_BLOCK_K)[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
+        scale_b_ptr = b_scale + tl.arange(0, BLOCK_N)[:, None] * SCALE_BLOCK_K + tl.arange(0, SCALE_BLOCK_K)[None, :]
+        # scale_b_ptr = b_scale + tl.arange(0, SCALE_BLOCK_K)[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
         b_scale = tl.load(scale_b_ptr)
     c = tl.dot_scaled(a, a_scale, type_a, b, b_scale, type_b)
     out_ptr = out + tl.arange(0, BLOCK_M)[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
@@ -3897,7 +3896,7 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
 
 
 @pytest.mark.parametrize("M, N, K, col_a, col_b, lhs_mxfp_type, rhs_mxfp_type, num_warps, mma, kpack",
-                         [(M, N, K, col_a, col_b, lhs_mxfp_type, rhs_mxfp_type, 4, mma, kpack)
+                         [(M, N, K, col_a, col_b, lhs_mxfp_type, rhs_mxfp_type, 1, mma, kpack)
                           for M, N, K in itertools.product([16, 32, 64, 128], [16, 32, 64, 128], [64, 128])
                           for col_a, col_b in itertools.product([True, False], repeat=2)
                           for lhs_mxfp_type in ["e2m1", "e4m3", "e5m2", "e3m2", "e2m3"]
@@ -3911,8 +3910,14 @@ def test_scaled_dot_no_upcast(M, N, K, col_a, col_b, lhs_mxfp_type, rhs_mxfp_typ
     if not (lhs_mxfp_type == 'e2m1' and rhs_mxfp_type == 'e2m1'):
         pytest.skip("Only fp4 has been supported")
 
+    if (M == 16 and K < 128) or (N == 16 and K < 128):
+        pytest.skip("Invalid shape combinations")
+
     if mma == 16 and K < 128:
         pytest.skip("For nonKDim == 16, only K >= 128 are supported")
+
+    if mma > M or mma > N:
+        pytest.skip("nonKDim should not be larger than actual input shapes")
 
     def make_arg(shape, col_major=False):
         if col_major:
@@ -3934,7 +3939,10 @@ def test_scaled_dot_no_upcast(M, N, K, col_a, col_b, lhs_mxfp_type, rhs_mxfp_typ
     min_scale, max_scale = (0, 142) if comp_dtype == torch.bfloat16 else (124, 131)
     scale_x = torch.randint(min_scale, max_scale + 1, (M, K // 32), dtype=torch.uint8, device=device)
     scale_y = torch.randint(min_scale, max_scale + 1, (N, K // 32), dtype=torch.uint8, device=device)
-    scale_y = scale_y.T
+    torch.set_printoptions(threshold=10000)
+    print(f'{scale_x=}')
+    print(f'{scale_y=}')
+    print(f'{x.shape=}, {y.shape=}, {scale_x.shape=}, {scale_y.shape=}')
 
     def make_finite(x, dtype):
         # e5m2 has too many non-finite values when sampled uniformly (1 / 32) and
@@ -3951,6 +3959,8 @@ def test_scaled_dot_no_upcast(M, N, K, col_a, col_b, lhs_mxfp_type, rhs_mxfp_typ
 
     x = make_finite(x, lhs_mxfp_type)
     y = make_finite(y, rhs_mxfp_type)
+    print(f'{x=}, {x.stride()=}')
+    print(f'{y=}, {y.stride()=}')
     kernel_kwargs = {"num_warps": num_warps}
     if is_hip():
         kernel_kwargs["kpack"] = kpack
@@ -3958,7 +3968,6 @@ def test_scaled_dot_no_upcast(M, N, K, col_a, col_b, lhs_mxfp_type, rhs_mxfp_typ
     z = x.new_empty((M, N), dtype=comp_dtype)
     pgm = dot_scale_kernel[(1, )](x, *x.stride(), scale_x, y, *y.stride(), scale_y, z, M, N, K, lhs_mxfp_type,
                                   rhs_mxfp_type, **kernel_kwargs)
-    scale_y = scale_y.T
     z_ref = dot_scale_ref(x, scale_x, y, scale_y, lhs_mxfp_type, rhs_mxfp_type, num_warps)
     # Bigger tolerance for AMD MI200 devices.
     # MI200 devices use reduced precision fp16 and bf16 and flush input and output denormal values

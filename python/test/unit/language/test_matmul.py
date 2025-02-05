@@ -6,7 +6,7 @@ import triton.language as tl
 import triton.tools.experimental_descriptor
 from test_mxfp import MXFP4Tensor, MXScaleTensor
 import re
-from triton._internal_testing import is_cuda, is_hip, is_hip_mi200
+from triton._internal_testing import is_cuda, is_hip, is_hip_mi200, is_hip_mi350
 
 
 def f8_to_f16(x, dtype):
@@ -684,7 +684,8 @@ def block_scale_fp4_matmul(  #
     offs_k = tl.arange(0, BLOCK_K // 2)
     offs_scale_k = tl.arange(0, BLOCK_K // VEC_SIZE)
     a_scale_ptr = a_scale + offs_am[:, None] * stride_scale + offs_scale_k[None, :]
-    b_scale_ptr = b_scale + offs_bn[:, None] * stride_scale + offs_scale_k[None, :]
+    # b_scale_ptr = b_scale + offs_bn[:, None] * stride_scale + offs_scale_k[None, :]
+    b_scale_ptr = b_scale + offs_scale_k[:, None] * stride_bk + offs_bn[None, :]
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=output_ptr.dtype.element_ty)
@@ -712,8 +713,12 @@ def block_scale_fp4_matmul(  #
                                                        (128, 256, 256), (128, 128, 64), (128, 64, 128)])
 @pytest.mark.parametrize(("scale_type", "VEC_SIZE"), [("float8_e8m0fnu", 32), ("float8_e4m3fn", 16)],
                          ids=["mxfp4", "nvfp4"])
-@pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 10, reason="Requires compute capability >= 10")
 def test_block_scale_fp4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, VEC_SIZE, scale_type, device):
+    if is_cuda() and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires compute capability >= 10")
+    if is_hip() and not is_hip_mi350():
+        pytest.skip("Only supported on MI350")
+
     NUM_STAGES = 1
     torch.manual_seed(42)
     a_mxfp4 = MXFP4Tensor(size=(M, K), device=device).random()
@@ -745,6 +750,7 @@ def test_block_scale_fp4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, VEC_SIZE, scale_typ
 
     output = a.new_empty((M, N), dtype=torch.float32)
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
+    b_scale = b_scale.T
     block_scale_fp4_matmul[grid](a, b, output, a_scale, b_scale, M, N, K, a_scale.stride(0), a.stride(0), a.stride(1),
                                  b.stride(0), b.stride(1), output.stride(0), output.stride(1), VEC_SIZE, BLOCK_M,
                                  BLOCK_N, BLOCK_K, NUM_STAGES=NUM_STAGES)

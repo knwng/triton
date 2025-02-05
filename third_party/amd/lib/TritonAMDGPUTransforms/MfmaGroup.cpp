@@ -45,7 +45,6 @@ static MfmaTypeId chooseAppropriateMfmaId(mlir::Type dataTypeA,
       llvm::isa<Float8E5M2Type>(dataTypeB)) {
     return MfmaTypeId::Fp16TyId;
   }
-  // f8f6f4
   if (isF8F6F4(dataTypeA) && isF8F6F4(dataTypeB)) {
     return MfmaTypeId::F8F6F4TyId;
   }

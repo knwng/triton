@@ -9,7 +9,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
-#include "llvm/TargetParser/TargetParser.h"
+#include "triton/Tools/LayoutUtils.h"
 #include <memory>
 
 using namespace mlir;
@@ -17,17 +17,10 @@ namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 using ::mlir::LLVM::AMD::scaleDotElemTypeToMLIRType;
 
-namespace mlir::triton::AMD {
-LogicalResult convertScaledMFMA(triton::DotOp op,
-                                triton::DotOp::Adaptor adaptor,
-                                const LLVMTypeConverter *typeConverter,
-                                ConversionPatternRewriter &rewriter);
-} // namespace mlir::triton::AMD
-
 namespace {
 using triton::AMD::ISAFamily;
 
-int getMfmaVersion(ISAFamily isaFamily, StringRef arch) {
+int getMfmaVersion(ISAFamily isaFamily) {
   switch (isaFamily) {
   case ISAFamily::CDNA1:
     return 1;
@@ -722,18 +715,15 @@ public:
     auto loc = dotOp.getLoc();
 
     RankedTensorType oldRetType = dotOp.getType();
-    if (!oldRetType.getEncoding() ||
-        !isa<ttg::BlockedEncodingAttr>(oldRetType.getEncoding()))
-      return failure();
+    // if (!oldRetType.getEncoding() ||
+    //     !isa<ttg::BlockedEncodingAttr>(oldRetType.getEncoding()))
+    //   return failure();
 
     if (!isa_and_nonnull<BlockedEncodingAttr>(oldRetType.getEncoding()))
       return rewriter.notifyMatchFailure(
           dotOp, "expected blocked encoding result tensor");
 
-    static size_t cnt = 0;
-    cnt++;
-    llvm::outs() << loc << " ScaledBlockedToMFMANoUpcast Start " << cnt
-                 << " times\n";
+    llvm::outs() << "ScaledBlockedToMFMANoUpcast Start\n";
 
     unsigned rank = oldRetType.getRank();
     if (rank == 3)
@@ -746,9 +736,6 @@ public:
 
     ScaleDotElemType aElemType = dotOp.getLhsType();
     ScaleDotElemType bElemType = dotOp.getRhsType();
-    llvm::outs() << loc
-                 << " ScaledBlockedToMFMANoUpcast aElemType: " << aElemType
-                 << ", bElemType: " << bElemType << "\n";
     auto supportsTypes = [](ScaleDotElemType elemType) {
       return elemType == ScaleDotElemType::E2M1;
     };
@@ -761,17 +748,14 @@ public:
       return rewriter.notifyMatchFailure(dotOp, "NYI: mxfp6, mxfp8");
     }
 
-    llvm::outs() << loc << " ScaledBlockedToMFMANoUpcast transform\n";
-
     MLIRContext *ctx = dotOp.getContext();
     auto moduleOp = dotOp->getParentOfType<ModuleOp>();
 
     ttg::CTALayoutAttr ctaLayout = ttg::getCTALayout(oldRetType.getEncoding());
-    int numWarps = ttg::TritonGPUDialect::getNumWarps(moduleOp);
+    unsigned numWarps = ttg::TritonGPUDialect::getNumWarps(moduleOp);
     int numThreads = ttg::TritonGPUDialect::getThreadsPerWarp(moduleOp);
 
-    llvm::outs() << loc << " ScaledBlockedToMFMANoUpcast nonKDim: " << nonKDim
-                 << "\n";
+    llvm::outs() << "ScaledBlockedToMFMANoUpcast nonKDim: " << nonKDim << "\n";
     // Choose a suitable Scaled MFMA instruction for this scaled dot op.
     FailureOr<MfmaInsn> mfmaInstr =
         chooseMfmaInstruction(dotOp, /*mfmaVersion=*/4, nonKDim);
@@ -788,9 +772,27 @@ public:
     unsigned kDim = mfmaInstr.value().getKDim();
     unsigned kBase = mfmaInstr.value().getKBase();
     assert(mDim == nDim);
+    llvm::outs() << "ScaledBlockedToMFMANoUpcast Selected inst name: "
+                 << mfmaInstr.value().getInsnName() << "\n";
 
     auto warpsPerTile =
         warpsPerTileMFMA(dotOp, oldRetType.getShape(), numWarps, {mDim, nDim});
+
+    auto oldshape = oldRetType.getShape();
+
+    llvm::outs() << "oldRetType.getShape() size: " << oldshape.size() << "\n";
+    llvm::outs() << "oldRetType.getShape(): " << oldshape[0] << ", "
+                 << oldshape[1] << "\n";
+
+    if (warpsPerTile.size() == 3) {
+      llvm::outs() << "ScaledBlockedToMFMANoUpcast warpsPerTile: ("
+                   << warpsPerTile[0] << ", " << warpsPerTile[1] << ", "
+                   << warpsPerTile[2] << ")\n";
+    } else {
+      assert(warpsPerTile.size() == 2);
+      llvm::outs() << "ScaledBlockedToMFMANoUpcast warpsPerTile: ("
+                   << warpsPerTile[0] << ", " << warpsPerTile[1] << ")\n";
+    }
 
     // Always use transposed mfma layout. This enables larger vectorization
     // for global store instructions.
@@ -810,10 +812,11 @@ public:
       // For the mfma_scale_f32_*_f8f6f4 instructions, each thread consumes 32
       // elements. But since two fp4 elements are packed into one int8, the
       // kWidth is 16 for fp4.
-      unsigned kWidth = kBase * kPack;
+      unsigned kWidth = kBase;
       if (type == ScaleDotElemType::E2M1) {
         kWidth /= 2;
       }
+      llvm::outs() << "convertInputLayout: kWidth: " << kWidth << "\n";
       auto newVEncoding = DotOperandEncodingAttr::get(
           ctx, idx, newRetType.getEncoding(), kWidth);
       auto newVType = RankedTensorType::get(
@@ -822,6 +825,56 @@ public:
     };
     a = convertInputLayout(a, 0, aElemType);
     b = convertInputLayout(b, 1, bElemType);
+
+    unsigned kWidth = kBase;
+    auto newAEncoding = DotOperandEncodingAttr::get(
+        ctx, /*idx=*/0, newRetType.getEncoding(),
+        aElemType == ScaleDotElemType::E2M1 ? kWidth / 2 : kWidth);
+
+    StringAttr kRegister = StringAttr::get(ctx, "register");
+    StringAttr kLane = StringAttr::get(ctx, "lane");
+    StringAttr kWarp = StringAttr::get(ctx, "warp");
+    StringAttr kBlock = StringAttr::get(ctx, "block");
+
+    auto order = ttg::getMatrixOrder(rank, /*rowMajor=*/true);
+    auto regs = tt::identityStandardND(kRegister, {1, 1}, order);
+    auto lanes =
+        tt::identityStandardND(kLane, {mDim, numThreads / mDim}, order);
+    llvm::outs() << "MatrixOrder: (" << order[0] << ", " << order[1] << ")\n";
+    llvm::outs() << "mDim: " << mDim << ", numThreads: " << numThreads
+                 << ", lanes: " << lanes << "\n";
+
+    llvm::outs() << "regs: " << regs << "\n";
+
+    // Extract warp layout from dotAEncoding
+    // In the future we'll have some nice division utils, but until then...
+    auto dotLL = newAEncoding.toLinearLayout(a.getType().getShape());
+    llvm::outs() << "dotLL: " << dotLL << "\n";
+    // LinearLayout::BasesT scaleBases = dotLL.getBases();
+    // auto &warpBases = scaleBases[kWarp];
+    // // The tile shape was [16, 2 * 4 * kWidth] with broadcasting in K
+    // // We divide the M dimension by 16
+    // auto div = mDim;
+    // for (auto &warpBase : warpBases) {
+    //   if (warpBase[rank - 2] != 0) {
+    //     assert(warpBase[rank - 2] % div == 0);
+    //     warpBase[rank - 2] /= div;
+    //   }
+    // }
+
+    auto standardOutDims = llvm::to_vector(dotLL.getOutDimNames());
+    // warpBlockBases[kWarp] = warpBases;
+    // assert(scaleBases[kBlock].empty() && "NYI: CGAs");
+    // warpBlockBases[kBlock] = {};
+
+    LinearLayout warpBlock = identityStandardND(kWarp, warpsPerTile, order);
+    auto warpBases = warpBlock.getBases();
+
+    LinearLayout::BasesT warpBlockBases;
+    warpBlockBases[kWarp] = warpBases[kWarp];
+    warpBlockBases[kBlock] = {};
+    warpBlock = LinearLayout(std::move(warpBlockBases), standardOutDims);
+    llvm::outs() << "warpBlock before: " << warpBlock << "\n";
 
     auto convertScaleLayout = [&](TensorValue scale, int nonKDim, int k,
                                   int idx) -> TensorValue {
@@ -835,12 +888,43 @@ public:
                 dotOp->getLoc(), rewriter.getI32IntegerAttr(0x7F)));
       }
 
-      int kWidth = kBase * kPack / 32;
-      auto newScaleEncoding = DotOperandEncodingAttr::get(
-          ctx, /*opIdx=*/idx, newRetType.getEncoding(), kWidth);
+      LinearLayout lanes = LinearLayout::empty();
+      if (mDim == 32) {
+        lanes = LinearLayout(
+            {{kLane, {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}, {1, 0}}}},
+            {standardOutDims[order[0]], standardOutDims[order[1]]});
+      } else {
+        assert(mDim == 16);
+        lanes = LinearLayout(
+            {{kLane, {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {1, 0}, {2, 0}}}},
+            {standardOutDims[order[0]], standardOutDims[order[1]]});
+      }
+
+      warpBlock = warpBlock.transposeOuts(
+          {standardOutDims[order[0]], standardOutDims[order[1]]});
+
+      llvm::outs() << "idx: " << idx << " lanes: " << lanes << "\n";
+      llvm::outs() << "idx: " << idx << " warpBlock: " << warpBlock << "\n";
+
+      auto newLL = (regs * lanes) * warpBlock;
+
+      auto shape = scale.getType().getShape();
+      llvm::outs() << "idx: " << idx << " newLL before: " << newLL << "\n";
+      for (auto d : newAEncoding.getRepOrder()) {
+        auto outDim = standardOutDims[d];
+        auto dimSize = newLL.getOutDimSize(outDim);
+        newLL *=
+            LinearLayout::identity1D(shape[d] / dimSize, kRegister, outDim);
+      }
+      newLL = newLL.transposeOuts(standardOutDims);
+      llvm::outs() << "idx: " << idx << " newLL: " << newLL << "\n";
+      // newLL = ensureLayoutNotSmallerThan(newLL, shape);
+      // llvm::outs() << "idx: " << idx << " newLL after ensure layout: " <<
+      // newLL << "\n";
+      Attribute newScaleEncoding = ttg::LinearEncodingAttr::get(ctx, newLL);
+
       auto newScaleType = RankedTensorType::get(
-          scale.getType().getShape(), scale.getType().getElementType(),
-          newScaleEncoding);
+          shape, scale.getType().getElementType(), newScaleEncoding);
       return rewriter.create<ttg::ConvertLayoutOp>(scale.getLoc(), newScaleType,
                                                    scale);
     };
@@ -1205,12 +1289,12 @@ public:
     case ISAFamily::CDNA1:
     case ISAFamily::CDNA2:
     case ISAFamily::CDNA3: {
-      int mfmaVersion = getMfmaVersion(isaFamily, archGenerationName);
       patterns.add<::ScaledBlockedToMFMANoUpcast>(
-          context, mfmaVersion, matrixInstructionSize, kPack, /*benefit=*/10);
-      patterns.add<::BlockedToMFMA, ::ScaledBlockedToMFMA>(
           context, getMfmaVersion(isaFamily), matrixInstructionSize, kPack,
-          /*benefit=*/2);
+          /*benefit=*/10);
+      // patterns.add<::BlockedToMFMA, ::ScaledBlockedToMFMA>(
+      //     context, getMfmaVersion(isaFamily), matrixInstructionSize, kPack,
+      //     /*benefit=*/2);
       break;
     }
     case ISAFamily::RDNA3:
