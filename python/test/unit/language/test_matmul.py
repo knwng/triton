@@ -684,8 +684,7 @@ def block_scale_fp4_matmul(  #
     offs_k = tl.arange(0, BLOCK_K // 2)
     offs_scale_k = tl.arange(0, BLOCK_K // VEC_SIZE)
     a_scale_ptr = a_scale + offs_am[:, None] * stride_scale + offs_scale_k[None, :]
-    # b_scale_ptr = b_scale + offs_bn[:, None] * stride_scale + offs_scale_k[None, :]
-    b_scale_ptr = b_scale + offs_scale_k[:, None] * stride_bk + offs_bn[None, :]
+    b_scale_ptr = b_scale + offs_bn[:, None] * stride_scale + offs_scale_k[None, :]
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=output_ptr.dtype.element_ty)
@@ -716,8 +715,11 @@ def block_scale_fp4_matmul(  #
 def test_block_scale_fp4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, VEC_SIZE, scale_type, device):
     if is_cuda() and torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("Requires compute capability >= 10")
-    if is_hip() and not is_hip_mi350():
-        pytest.skip("Only supported on MI350")
+    if is_hip():
+        if not is_hip_mi350():
+            pytest.skip("Only supported on MI350")
+        if scale_type != 'float8_e8m0fnu':
+            pytest.skip("AMDGPU only support E8M0 scale")
 
     NUM_STAGES = 1
     torch.manual_seed(42)
@@ -744,15 +746,19 @@ def test_block_scale_fp4(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, VEC_SIZE, scale_typ
         a_scale_ref = a_scale
         b_scale_ref = b_scale
 
+    print(f'{a.shape=}, {a_scale.shape=}')
+    print(f'{b.shape=}, {b_scale.shape=}')
+
     a_scale_ref = a_scale_ref.to(torch.float32).repeat_interleave(VEC_SIZE, dim=1)[:M, :K]
     b_scale_ref = b_scale_ref.to(torch.float32).repeat_interleave(VEC_SIZE, dim=1).T.contiguous()[:K, :N]
     ref_out = torch.matmul(a_mxfp4.to(torch.float32) * a_scale_ref, b_ref * b_scale_ref)
 
     output = a.new_empty((M, N), dtype=torch.float32)
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
-    b_scale = b_scale.T
+    # b_scale = b_scale.T
+    kernel_kwargs = {"num_warps": 1}
     block_scale_fp4_matmul[grid](a, b, output, a_scale, b_scale, M, N, K, a_scale.stride(0), a.stride(0), a.stride(1),
                                  b.stride(0), b.stride(1), output.stride(0), output.stride(1), VEC_SIZE, BLOCK_M,
-                                 BLOCK_N, BLOCK_K, NUM_STAGES=NUM_STAGES)
+                                 BLOCK_N, BLOCK_K, NUM_STAGES=NUM_STAGES, **kernel_kwargs)
 
     torch.testing.assert_close(ref_out, output, atol=1e-2, rtol=1e-2)
