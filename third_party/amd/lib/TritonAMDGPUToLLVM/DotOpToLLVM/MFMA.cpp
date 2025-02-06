@@ -612,35 +612,35 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     auto workIDY = rewriter.create<ROCDL::ThreadIdYOp>(loc, i32_ty);
     auto workIDZ = rewriter.create<ROCDL::ThreadIdZOp>(loc, i32_ty);
 
-    auto printElems = [&](const char *name, Value v) {
-      mlir::triton::AMD::TargetInfo targetInfo("gfx950");
-      auto elems = unpackLLElements(loc, v, rewriter);
-      std::stringstream ss;
-      ss << name << "(" << elems.size() << ")(tidx: %d, tidy: %d, tidz: %d): ";
-      if (elems.size() >= 5) {
-        ss << "(%d, %d, %d, ..., %d, %d)";
-        auto size = elems.size();
-        targetInfo.printf(rewriter, ss.str(),
-                          {workIDX, workIDY, workIDZ, elems[0], elems[1],
-                           elems[2], elems[size - 2], elems[size - 1]});
-      } else if (elems.size() == 2) {
-        ss << "(%d, %d)";
-        targetInfo.printf(rewriter, ss.str(),
-                          {workIDX, workIDY, workIDZ, elems[0], elems[1]});
-      } else if (elems.size() == 1) {
-        ss << "(%d)";
-        targetInfo.printf(rewriter, ss.str(),
-                          {workIDX, workIDY, workIDZ, elems[0]});
-      } else if (elems.size() == 0) {
-        ss << "empty";
-        targetInfo.printf(rewriter, ss.str(), {workIDX, workIDY, workIDZ});
-      }
-    };
+    // auto printElems = [&](const char *name, Value v) {
+    //   mlir::triton::AMD::TargetInfo targetInfo("gfx950");
+    //   auto elems = unpackLLElements(loc, v, rewriter);
+    //   std::stringstream ss;
+    //   ss << name << "(" << elems.size() << ")(tidx: %d, tidy: %d, tidz: %d):
+    //   "; if (elems.size() >= 5) {
+    //     ss << "(%d, %d, %d, ..., %d, %d)";
+    //     auto size = elems.size();
+    //     targetInfo.printf(rewriter, ss.str(),
+    //                       {workIDX, workIDY, workIDZ, elems[0], elems[1],
+    //                        elems[2], elems[size - 2], elems[size - 1]});
+    //   } else if (elems.size() == 2) {
+    //     ss << "(%d, %d)";
+    //     targetInfo.printf(rewriter, ss.str(),
+    //                       {workIDX, workIDY, workIDZ, elems[0], elems[1]});
+    //   } else if (elems.size() == 1) {
+    //     ss << "(%d)";
+    //     targetInfo.printf(rewriter, ss.str(),
+    //                       {workIDX, workIDY, workIDZ, elems[0]});
+    //   } else if (elems.size() == 0) {
+    //     ss << "empty";
+    //     targetInfo.printf(rewriter, ss.str(), {workIDX, workIDY, workIDZ});
+    //   }
+    // };
 
-    printElems("loadedA", loadedA);
-    printElems("loadedAScale", loadedAScale);
-    printElems("loadedB", loadedB);
-    printElems("loadedBScale", loadedBScale);
+    // printElems("loadedA", loadedA);
+    // printElems("loadedAScale", loadedAScale);
+    // printElems("loadedB", loadedB);
+    // printElems("loadedBScale", loadedBScale);
 
     assert(repAScale[2] == repBScale[1]);
 

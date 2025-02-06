@@ -298,9 +298,9 @@ OperandTypesVector getOperandTypesForWmmaOp(PatternRewriter &rewriter,
 //
 // @param rewriter
 // @param value original tensor value, which we need to convert and cast
-// @param newEncoding new encoding for the tenosr
+// @param newEncoding new encoding for the tensor
 // @param newElemType new element type for the tensor
-// @return converted and optionaly casted tensor value
+// @return converted and optionally casted tensor value
 //===---------------------------------------------------------------------===//
 Value convertAndCastTensor(PatternRewriter &rewriter, Value value,
                            Attribute newEncoding, Type newElemType) {
@@ -506,6 +506,13 @@ public:
                              mfmaInstr.getElementTypeA());
     b = convertAndCastTensor(rewriter, b, newBEncoding,
                              mfmaInstr.getElementTypeB());
+
+    llvm::outs() << "cLL: " << mfmaEnc.toLinearLayout(retShape) << "\n";
+    llvm::outs() << "aLL: " << newAEncoding.toLinearLayout(oldAType.getShape())
+                 << "\n";
+    llvm::outs() << "bLL: " << newBEncoding.toLinearLayout(oldBType.getShape())
+                 << "\n";
+
     auto newDot = rewriter.create<tt::DotOp>(
         dotOp.getLoc(), newAcc.getType(), a, b, newAcc,
         dotOp.getInputPrecision(), dotOp.getMaxNumImpreciseAcc());
@@ -775,14 +782,13 @@ public:
     llvm::outs() << "ScaledBlockedToMFMANoUpcast Selected inst name: "
                  << mfmaInstr.value().getInsnName() << "\n";
 
+    auto oldShape = oldRetType.getShape();
     auto warpsPerTile =
-        warpsPerTileMFMA(dotOp, oldRetType.getShape(), numWarps, {mDim, nDim});
+        warpsPerTileMFMA(dotOp, oldShape, numWarps, {mDim, nDim});
 
-    auto oldshape = oldRetType.getShape();
-
-    llvm::outs() << "oldRetType.getShape() size: " << oldshape.size() << "\n";
-    llvm::outs() << "oldRetType.getShape(): " << oldshape[0] << ", "
-                 << oldshape[1] << "\n";
+    llvm::outs() << "oldRetType.getShape() size: " << oldShape.size() << "\n";
+    llvm::outs() << "oldRetType.getShape(): " << oldShape[0] << ", "
+                 << oldShape[1] << "\n";
 
     if (warpsPerTile.size() == 3) {
       llvm::outs() << "ScaledBlockedToMFMANoUpcast warpsPerTile: ("
@@ -800,8 +806,8 @@ public:
         ctx, /*versionMajor=*/4, /*versionMinor=*/0, warpsPerTile,
         /*instrShape=*/mDim, nDim, /*isTransposed=*/true, ctaLayout);
 
-    auto newRetType = RankedTensorType::get(
-        oldRetType.getShape(), oldRetType.getElementType(), mfmaEnc);
+    auto newRetType =
+        RankedTensorType::get(oldShape, oldRetType.getElementType(), mfmaEnc);
 
     auto newAcc = rewriter.create<ttg::ConvertLayoutOp>(
         dotOp.getC().getLoc(), newRetType, dotOp.getC());
@@ -819,6 +825,10 @@ public:
       llvm::outs() << "convertInputLayout: kWidth: " << kWidth << "\n";
       auto newVEncoding = DotOperandEncodingAttr::get(
           ctx, idx, newRetType.getEncoding(), kWidth);
+
+      auto dotLL = newVEncoding.toLinearLayout(v.getType().getShape());
+      llvm::outs() << "idx: " << idx << " LL: " << dotLL << "\n";
+
       auto newVType = RankedTensorType::get(
           vType.getShape(), vType.getElementType(), newVEncoding);
       return rewriter.create<ttg::ConvertLayoutOp>(v.getLoc(), newVType, v);
@@ -831,6 +841,10 @@ public:
         ctx, /*idx=*/0, newRetType.getEncoding(),
         aElemType == ScaleDotElemType::E2M1 ? kWidth / 2 : kWidth);
 
+    auto newBEncoding = DotOperandEncodingAttr::get(
+        ctx, /*idx=*/1, newRetType.getEncoding(),
+        bElemType == ScaleDotElemType::E2M1 ? kWidth / 2 : kWidth);
+
     StringAttr kRegister = StringAttr::get(ctx, "register");
     StringAttr kLane = StringAttr::get(ctx, "lane");
     StringAttr kWarp = StringAttr::get(ctx, "warp");
@@ -838,19 +852,22 @@ public:
 
     auto order = ttg::getMatrixOrder(rank, /*rowMajor=*/true);
     auto regs = tt::identityStandardND(kRegister, {1, 1}, order);
-    auto lanes =
-        tt::identityStandardND(kLane, {mDim, numThreads / mDim}, order);
-    llvm::outs() << "MatrixOrder: (" << order[0] << ", " << order[1] << ")\n";
-    llvm::outs() << "mDim: " << mDim << ", numThreads: " << numThreads
-                 << ", lanes: " << lanes << "\n";
-
+    // auto regs = tt::identityStandardND(kRegister, {2, 2}, order);
+    // auto regs = tt::identityStandardND(
+    //     kRegister,
+    //     {static_cast<unsigned>(oldShape[0]) / mDim / warpsPerTile[0],
+    //      static_cast<unsigned>(oldShape[1]) / nDim / warpsPerTile[1]},
+    //     order);
     llvm::outs() << "regs: " << regs << "\n";
+    llvm::outs() << "MatrixOrder: (" << order[0] << ", " << order[1] << ")\n";
+    llvm::outs() << "mDim: " << mDim << ", numThreads: " << numThreads << "\n";
 
     // Extract warp layout from dotAEncoding
     // In the future we'll have some nice division utils, but until then...
     auto dotLL = newAEncoding.toLinearLayout(a.getType().getShape());
+    auto cLL = mfmaEnc.toLinearLayout(oldShape);
     llvm::outs() << "dotLL: " << dotLL << "\n";
-    // LinearLayout::BasesT scaleBases = dotLL.getBases();
+    llvm::outs() << "cLL: " << cLL << "\n";
     // auto &warpBases = scaleBases[kWarp];
     // // The tile shape was [16, 2 * 4 * kWidth] with broadcasting in K
     // // We divide the M dimension by 16
@@ -862,19 +879,107 @@ public:
     //   }
     // }
 
+    auto printBasis = [&](StringAttr name,
+                          std::vector<std::vector<int32_t>> basis) {
+      llvm::outs() << name << ":\n";
+      for (const auto vec : basis) {
+        for (int32_t ele : vec) {
+          llvm::outs() << ele << ", ";
+        }
+        llvm::outs() << "\n";
+      }
+    };
+
+    auto printBases = [&](LinearLayout::BasesT base) {
+      for (const auto &[k, v] : base) {
+        printBasis(k, v);
+      }
+    };
+
     auto standardOutDims = llvm::to_vector(dotLL.getOutDimNames());
     // warpBlockBases[kWarp] = warpBases;
     // assert(scaleBases[kBlock].empty() && "NYI: CGAs");
     // warpBlockBases[kBlock] = {};
 
-    LinearLayout warpBlock = identityStandardND(kWarp, warpsPerTile, order);
-    auto warpBases = warpBlock.getBases();
-
+    LinearLayout::BasesT scaleBases = dotLL.getBases();
+    auto &warpBases = scaleBases[kWarp];
+    printBasis(StringAttr::get(ctx, "warpBases A"), warpBases);
+    // The tile shape was [16, 2 * 4 * kWidth] with broadcasting in K
+    // We divide the M dimension by 16
+    // auto div = 16;
+    auto div = 32;
+    for (auto &warpBase : warpBases) {
+      if (warpBase[rank - 2] != 0) {
+        assert(warpBase[rank - 2] % div == 0);
+        warpBase[rank - 2] /= div;
+      }
+    }
+    printBasis(StringAttr::get(ctx, "warpBases A after"), warpBases);
     LinearLayout::BasesT warpBlockBases;
-    warpBlockBases[kWarp] = warpBases[kWarp];
+    warpBlockBases[kWarp] = warpBases;
+    assert(scaleBases[kBlock].empty() && "NYI: CGAs");
     warpBlockBases[kBlock] = {};
-    warpBlock = LinearLayout(std::move(warpBlockBases), standardOutDims);
-    llvm::outs() << "warpBlock before: " << warpBlock << "\n";
+    auto warpBlock = LinearLayout(std::move(warpBlockBases), standardOutDims);
+    llvm::outs() << " warpBlock A: " << warpBlock << "\n";
+
+    auto dotBLL = newBEncoding.toLinearLayout(b.getType().getShape());
+    LinearLayout::BasesT scaleBBases = dotBLL.getBases();
+    auto &warpBBases = scaleBBases[kWarp];
+    printBasis(StringAttr::get(ctx, "warpBases B"), warpBBases);
+    for (auto &warpBase : warpBBases) {
+      if (warpBase[rank - 1] != 0) {
+        assert(warpBase[rank - 2] % div == 0);
+        warpBase[rank - 1] /= div;
+      }
+    }
+    printBasis(StringAttr::get(ctx, "warpBases B after"), warpBBases);
+    LinearLayout::BasesT warpBlockBBases;
+    warpBlockBBases[kWarp] = warpBBases;
+    assert(scaleBBases[kBlock].empty() && "NYI: CGAs");
+    warpBlockBBases[kBlock] = {};
+    auto warpBBlock = LinearLayout(std::move(warpBlockBBases), standardOutDims);
+    llvm::outs() << " warpBlock B: " << warpBBlock << "\n";
+
+    // LinearLayout::BasesT warpBlockBases;
+    // warpBlockBases[kWarp] = warpBases;
+    // assert(scaleBases[kBlock].empty() && "NYI: CGAs");
+    // warpBlockBases[kBlock] = {};
+    // // standardOutDims = llvm::to_vector(dotLL.getOutDimNames());
+    // auto warpBlock = LinearLayout(std::move(warpBlockBases), standardOutDims,
+    // /*requireSurjective=*/false); llvm::outs() << "warpBlock initial: " <<
+    // warpBlock << "\n";
+
+    using basisT = std::vector<std::vector<int32_t>>;
+    auto createLL = [&](int idx, basisT &warpBases) {
+      LinearLayout lanes = LinearLayout::empty();
+      basisT warps;
+      if (idx == 0) {
+        warps = {{0, 0}, {0, 32}};
+      } else {
+        warps = {{0, 32}, {0, 0}};
+      }
+      if (mDim == 32) {
+        lanes = LinearLayout(
+            {
+                {kLane, {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}, {1, 0}}},
+                {kWarp, warps},
+                {kBlock, {}}
+                //  {kWarp, warpBases},
+                //  {kBlock, {}}
+            },
+            {standardOutDims[order[0]], standardOutDims[order[1]]});
+      } else {
+        assert(mDim == 16);
+        lanes = LinearLayout(
+            {
+                {kLane, {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {1, 0}, {2, 0}}},
+                //  {kWarp, warpBases},
+                //  {kBlock, {}}
+            },
+            {standardOutDims[order[0]], standardOutDims[order[1]]});
+      }
+      return lanes;
+    };
 
     auto convertScaleLayout = [&](TensorValue scale, int nonKDim, int k,
                                   int idx) -> TensorValue {
@@ -888,28 +993,91 @@ public:
                 dotOp->getLoc(), rewriter.getI32IntegerAttr(0x7F)));
       }
 
-      LinearLayout lanes = LinearLayout::empty();
-      if (mDim == 32) {
-        lanes = LinearLayout(
-            {{kLane, {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {0, 16}, {1, 0}}}},
-            {standardOutDims[order[0]], standardOutDims[order[1]]});
-      } else {
-        assert(mDim == 16);
-        lanes = LinearLayout(
-            {{kLane, {{0, 1}, {0, 2}, {0, 4}, {0, 8}, {1, 0}, {2, 0}}}},
-            {standardOutDims[order[0]], standardOutDims[order[1]]});
-      }
+      // // SmallVector<unsigned> order;
+      // // if (idx == 0) {
+      // //   order = ttg::getMatrixOrder(rank, /*rowMajor=*/true);
+      // // } else {
+      // //   order = ttg::getMatrixOrder(rank, /*rowMajor=*/false);
+      // // }
+      // // llvm::outs() << "idx: " << idx << ", order: (" << order[0] << ", "
+      // //              << order[1] << ")\n";
 
-      warpBlock = warpBlock.transposeOuts(
-          {standardOutDims[order[0]], standardOutDims[order[1]]});
+      // LinearLayout warpBlock = identityStandardND(kWarp, warpsPerTile,
+      // order); llvm::outs() << "warpBlock initial: " << warpBlock << "\n";
+      // // auto warpBases = warpBlock.getBases();
 
+      // // LinearLayout::BasesT warpBlockBases;
+      // // warpBlockBases[kWarp] = warpBases[kWarp];
+      // // warpBlockBases[kBlock] = {};
+      // // warpBlock =
+      // //     LinearLayout(std::move(warpBlockBases),
+      // //                  {standardOutDims[order[0]],
+      // //                  standardOutDims[order[1]]});
+      // warpBlock *= LinearLayout({{kBlock, {}}}, {standardOutDims[order[0]],
+      //                                            standardOutDims[order[1]]});
+      // llvm::outs() << "warpBlock before: " << warpBlock << "\n";
+
+      // // if (idx == 0) {
+      // //   warpBlock = warpBlock.transposeOuts(
+      // //       {standardOutDims[order[0]], standardOutDims[order[1]]});
+      // // } else {
+      // //   warpBlock = warpBlock.transposeOuts(
+      // //       {standardOutDims[order[1]], standardOutDims[order[0]]});
+      // // }
+      // if (idx == 1) {
+      //   warpBlock = warpBlock.transposeOuts(
+      //       {standardOutDims[order[1]], standardOutDims[order[0]]});
+      // }
+
+      // auto regs = tt::identityStandardND(kRegister, {2, 2}, order);
+
+      // LinearLayout regs = LinearLayout::empty();
+      // LinearLayout warpBlock = LinearLayout::empty();
+      // if (idx == 0) {
+      //   warpBlock = LinearLayout(
+      //       {{kWarp, {{0, 1}, {1, 0}}}, {kBlock, {}}},
+      //       {standardOutDims[order[0]], standardOutDims[order[1]]});
+      //   regs = tt::identityStandardND(kRegister, {2, 2}, {0, 1});
+      //   regs =
+      //   regs.transposeOuts(llvm::to_vector(warpBlock.getOutDimNames()));
+      // } else {
+      //   warpBlock = LinearLayout(
+      //       {{kWarp, {{1, 0}, {0, 1}}}, {kBlock, {}}},
+      //       {standardOutDims[order[0]], standardOutDims[order[1]]});
+      //   regs = tt::identityStandardND(kRegister, {2, 2}, {1, 0});
+      // }
+
+      // llvm::outs() << "idx: " << idx << " warpBlock: " << warpBlock << "\n";
+
+      // auto newLL = (regs * lanes) * warpBlock;
+      // LinearLayout lanes = LinearLayout::empty();
+      // if (idx == 0) {
+      //   lanes = createLL(warpBases);
+      // } else {
+      //   // lanes = createLL(warpBBases);
+      //   lanes = createLL(warpBases);
+      // }
+
+      LinearLayout lanes = createLL(idx, warpBases);
+
+      llvm::outs() << "idx: " << idx << " regs: " << regs << "\n";
       llvm::outs() << "idx: " << idx << " lanes: " << lanes << "\n";
-      llvm::outs() << "idx: " << idx << " warpBlock: " << warpBlock << "\n";
+      // LinearLayout warps = idx == 0 ? warpBlock : warpBBlock;
+      // LinearLayout warps = warpBlock;
+      // auto warps =
+      //     LinearLayout({{kWarp, {{0, 0}, {32, 0}}}, {kBlock, {}}},
+      //                  {standardOutDims[order[0]],
+      //                  standardOutDims[order[1]]});
+      // llvm::outs() << "idx: " << idx << " warps handcrafted: " << warps <<
+      // "\n";
 
-      auto newLL = (regs * lanes) * warpBlock;
+      // auto newLL = (regs * lanes) *
+      //              warps.transposeOuts(llvm::to_vector(lanes.getOutDimNames()));
+      auto newLL = regs * lanes;
 
       auto shape = scale.getType().getShape();
       llvm::outs() << "idx: " << idx << " newLL before: " << newLL << "\n";
+
       for (auto d : newAEncoding.getRepOrder()) {
         auto outDim = standardOutDims[d];
         auto dimSize = newLL.getOutDimSize(outDim);
@@ -918,9 +1086,6 @@ public:
       }
       newLL = newLL.transposeOuts(standardOutDims);
       llvm::outs() << "idx: " << idx << " newLL: " << newLL << "\n";
-      // newLL = ensureLayoutNotSmallerThan(newLL, shape);
-      // llvm::outs() << "idx: " << idx << " newLL after ensure layout: " <<
-      // newLL << "\n";
       Attribute newScaleEncoding = ttg::LinearEncodingAttr::get(ctx, newLL);
 
       auto newScaleType = RankedTensorType::get(
@@ -1292,9 +1457,9 @@ public:
       patterns.add<::ScaledBlockedToMFMANoUpcast>(
           context, getMfmaVersion(isaFamily), matrixInstructionSize, kPack,
           /*benefit=*/10);
-      // patterns.add<::BlockedToMFMA, ::ScaledBlockedToMFMA>(
-      //     context, getMfmaVersion(isaFamily), matrixInstructionSize, kPack,
-      //     /*benefit=*/2);
+      patterns.add<::BlockedToMFMA, ::ScaledBlockedToMFMA>(
+          context, getMfmaVersion(isaFamily), matrixInstructionSize, kPack,
+          /*benefit=*/2);
       break;
     }
     case ISAFamily::RDNA3:

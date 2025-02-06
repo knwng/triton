@@ -542,6 +542,7 @@ class JITFunction(KernelInterface[T]):
             sigkeys = [x.name for x in self.params]
             sigvals = [x[0] for x in specialization]
             signature = {k: v for (k, v) in zip(sigkeys, sigvals)}
+            print(f'{signature=}')
             # check arguments
             assert "device_type" not in kwargs, "device_type option is deprecated; current target will be used"
             assert "device" not in kwargs, "device option is deprecated; current device will be used"
@@ -559,6 +560,8 @@ class JITFunction(KernelInterface[T]):
             if self._call_hook(key, signature, device, constexprs, options, [attrs], warmup, before=True):
                 return None
             # compile the kernel
+            print(f'{constexprs=}')
+            print(f'{attrs=}')
             src = self.ASTSource(self, signature, constexprs, attrs)
             kernel = self.compile(src, target=target, options=options.__dict__)
             kernel_cache[key] = kernel

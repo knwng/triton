@@ -707,6 +707,8 @@ public:
     bool isFp4 = aType == ScaleDotElemType::E2M1;
 
     auto mmaEnc = getMMAEncoding(rewriter, scaledDotOp);
+    llvm::outs() << "NV mmaEncLL: "
+                 << mmaEnc.toLinearLayout(oldRetType.getShape()) << "\n";
     auto versionMajor = mmaEnc.getVersionMajor();
     assert(versionMajor == 2 ||
            versionMajor == 3 && "NYI: MMAV2 and MMAV3 only");
@@ -767,9 +769,27 @@ public:
       // Extract warp layout from dotAEncoding
       // In the future we'll have some nice division utils, but until then...
       auto dotLL = newAEncoding.toLinearLayout(a.getType().getShape());
+      llvm::outs() << "NV dotLL: " << dotLL << "\n";
       LinearLayout::BasesT scaleBases = dotLL.getBases();
       auto kWarp = StringAttr::get(ctx, "warp");
       auto &warpBases = scaleBases[kWarp];
+      auto printBasis = [&](StringAttr name,
+                            std::vector<std::vector<int32_t>> basis) {
+        llvm::outs() << name << ":\n";
+        for (const auto vec : basis) {
+          for (int32_t ele : vec) {
+            llvm::outs() << ele << ", ";
+          }
+          llvm::outs() << "\n";
+        }
+      };
+
+      auto printBases = [&](LinearLayout::BasesT base) {
+        for (const auto &[k, v] : base) {
+          printBasis(k, v);
+        }
+      };
+      printBasis(StringAttr::get(ctx, "warpBases before"), warpBases);
       // The tile shape was [16, 2 * 4 * kWidth] with broadcasting in K
       // We divide the M dimension by 16
       auto div = 16;
@@ -779,6 +799,7 @@ public:
           warpBase[rank - 2] /= div;
         }
       }
+      printBasis(StringAttr::get(ctx, "warpBases after"), warpBases);
 
       LinearLayout::BasesT warpBlockBases;
       auto standardOutDims = llvm::to_vector(dotLL.getOutDimNames());
@@ -787,11 +808,15 @@ public:
       assert(scaleBases[kBlock].empty() && "NYI: CGAs");
       warpBlockBases[kBlock] = {};
       auto warpBlock = LinearLayout(std::move(warpBlockBases), standardOutDims);
+      llvm::outs() << "NV regs: " << regs << "\n";
+      llvm::outs() << "NV lanes: " << lanes << "\n";
+      llvm::outs() << "NV warps: " << warpBlock << "\n";
 
       auto newLL =
           (regs * lanes) *
           warpBlock.transposeOuts(llvm::to_vector(lanes.getOutDimNames()));
       auto shape = scale.getType().getShape();
+      llvm::outs() << "NV newLL before: " << newLL << "\n";
 
       // Broadcast to the correct shape Equivalent to
       // newLL = ensureLayoutNotSmallerThan(newLL.transposeOuts(getRepOrder),
@@ -803,6 +828,7 @@ public:
             LinearLayout::identity1D(shape[d] / dimSize, kRegister, outDim);
       }
       newLL = newLL.transposeOuts(standardOutDims);
+      llvm::outs() << "NV newLL: " << newLL << "\n";
       newScaleEncoding = LinearEncodingAttr::get(ctx, std::move(newLL));
     }
 
@@ -1002,7 +1028,7 @@ public:
     transposeDots(m);
 
     mlir::RewritePatternSet patterns(context);
-    constexpr int benefitDefault = 1;
+    constexpr int benefitDefault = 100;
     constexpr int benefitMMAv5 = 10;
     patterns.add<BlockedToMMA, DecomposeScaledBlocked>(
         context, computeCapability, benefitDefault);
