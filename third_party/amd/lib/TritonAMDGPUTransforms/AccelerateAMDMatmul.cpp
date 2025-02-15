@@ -720,6 +720,8 @@ public:
     if (rank == 3)
       return rewriter.notifyMatchFailure(dotOp, "NYI: 3d case");
 
+    // llvm::outs() << "ScaledBlockedToScaledMFMAF8F6F4 start\n";
+
     TensorValue a = dotOp.getLhs();
     TensorValue b = dotOp.getRhs();
     TensorValue aScale = dotOp.getLhsScale();
@@ -733,20 +735,24 @@ public:
     ScaleDotElemType aElemType = dotOp.getLhsType();
     ScaleDotElemType bElemType = dotOp.getRhsType();
     auto supportsTypes = [](ScaleDotElemType elemType) {
-      return elemType == ScaleDotElemType::E2M1;
+      return elemType == ScaleDotElemType::E2M1 ||
+             elemType == ScaleDotElemType::E4M3 ||
+             elemType == ScaleDotElemType::E5M2;
     };
 
-    if (!supportsTypes(aElemType) || !supportsTypes(bElemType))
-      return rewriter.notifyMatchFailure(dotOp, "NYI: mxfp6, mxfp8");
+    if (!supportsTypes(aElemType) || !supportsTypes(bElemType)) {
+      // llvm::outs() << "NYI: mxfp6";
+      return rewriter.notifyMatchFailure(dotOp, "NYI: mxfp6");
+    }
 
     MLIRContext *ctx = dotOp.getContext();
     auto moduleOp = dotOp->getParentOfType<ModuleOp>();
 
     ttg::CTALayoutAttr ctaLayout = ttg::getCTALayout(oldRetType.getEncoding());
     unsigned numWarps = ttg::TritonGPUDialect::getNumWarps(moduleOp);
-    if (numWarps == 1)
-      return rewriter.notifyMatchFailure(dotOp,
-                                         "num_warps==1 is not supported");
+    // if (numWarps == 1)
+    //   return rewriter.notifyMatchFailure(dotOp,
+    //                                      "num_warps==1 is not supported");
 
     // Choose a suitable Scaled MFMA instruction for this scaled dot op.
     FailureOr<MfmaInsn> mfmaInstr =
@@ -754,6 +760,9 @@ public:
     if (failed(mfmaInstr))
       return rewriter.notifyMatchFailure(dotOp,
                                          "cannot choose scaled mfma intrinsic");
+
+    // llvm::outs() << "mfma inst selected: " << mfmaInstr->getInsnName() <<
+    // "\n";
 
     unsigned mDim = mfmaInstr.value().getMDim();
     unsigned nDim = mfmaInstr.value().getNDim();
@@ -764,11 +773,21 @@ public:
     auto warpsPerTile =
         warpsPerTileMFMA(dotOp, oldShape, numWarps, {mDim, nDim});
 
+    // llvm::outs() << "aElemType: " << aElemType << ", bElemType: " <<
+    // bElemType
+    //              << "\n";
+
+    // llvm::outs() << "warpsPerTile: (" << warpsPerTile[0] << ", "
+    //              << warpsPerTile[1] << ")\n";
+
     // Always use transposed mfma layout. This enables larger vectorization
     // for global store instructions.
     auto mfmaEnc = ttg::AMDMfmaEncodingAttr::get(
         ctx, /*versionMajor=*/mfmaVersion, /*versionMinor=*/0, warpsPerTile,
         /*instrShape=*/mDim, nDim, /*isTransposed=*/true, ctaLayout);
+
+    // auto mfmaEncLL = mfmaEnc.toLinearLayout(oldShape);
+    // llvm::outs() << "mfmaEncLL: " << mfmaEncLL << "\n";
 
     auto newRetType =
         RankedTensorType::get(oldShape, oldRetType.getElementType(), mfmaEnc);
@@ -811,6 +830,10 @@ public:
 
     auto aEncLL = newAEncoding.toLinearLayout(a.getType().getShape());
     auto standardOutDims = llvm::to_vector(aEncLL.getOutDimNames());
+
+    // llvm::outs() << "aEncLL: " << aEncLL << "\n";
+    auto bEncLL = newBEncoding.toLinearLayout(b.getType().getShape());
+    // llvm::outs() << "bEncLL: " << bEncLL << "\n";
 
     using basisT = std::vector<std::vector<int32_t>>;
     auto createLinearLayout = [&](int idx, const basisT &warpBasis) {
@@ -893,6 +916,7 @@ public:
             LinearLayout::identity1D(shape[d] / dimSize, kRegister, outDim);
       }
       newLL = newLL.transposeOuts(standardOutDims);
+      // llvm::outs() << "idx: " << idx << ", newLL: " << newLL << "\n";
       Attribute newScaleEncoding = ttg::LinearEncodingAttr::get(ctx, newLL);
 
       auto newScaleType = RankedTensorType::get(
@@ -909,6 +933,8 @@ public:
 
     rewriter.replaceOpWithNewOp<ttg::ConvertLayoutOp>(dotOp, oldRetType,
                                                       newDot);
+    // llvm::outs() << "ScaledBlockedToScaledMFMAF8F6F4 succeed\n";
+
     return success();
   }
 };
