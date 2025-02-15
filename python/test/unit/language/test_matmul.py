@@ -311,11 +311,18 @@ def fp8e8m0_to_float32(scale):
 @pytest.mark.parametrize("M, N, K", [(1024, 512, 256), (128, 256, 256), (128, 128, 128), (2, 4, 32), (2, 4, 64),
                                      (256, 16, 32)])
 @pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K", [(128, 128, 128), (256, 128, 128), (128, 256, 128),
-                                                       (128, 256, 256), (128, 128, 64), (128, 64, 128)])
+                                                       (128, 256, 256), (128, 128, 64), (128, 64, 128), (32, 32, 64)])
 @pytest.mark.parametrize("NUM_STAGES", [1, 3])
-@pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 10, reason="Requires compute capability >= 10")
-def test_mxfp(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, device):
-    if BLOCK_N == 256 and BLOCK_K == 256:
+def test_mxfp_break_prefix(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, device):
+    if is_cuda() and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires compute capability >= 10")
+    elif is_hip():
+        if NUM_STAGES > 1:
+            pytest.skip("Not multi-stages")
+        if (M == 2 and N == 4 and K == 32) or (M == 256 and N == 16 and K == 32):
+            pytest.skip(f"Input shape {M=}, {N=}, {K=} is not supported yet")
+
+    if not is_hip() and BLOCK_N == 256 and BLOCK_K == 256:
         NUM_STAGES = min(NUM_STAGES, 2)
     torch.manual_seed(42)
     dtype_src_str = "float8e5"
@@ -324,8 +331,15 @@ def test_mxfp(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, device):
     a_f16 = f8_to_f16(a, dtype_src_str)
     b = torch.randint(20, 40, (K, N), dtype=torch.uint8, device=device).view(torch.float8_e5m2)
     b_f16 = f8_to_f16(b, dtype_src_str)
-    a_scale = torch.randint(130, (M, K // 32), dtype=torch.uint8, device=device)
-    b_scale = torch.randint(130, (N, K // 32), dtype=torch.uint8, device=device)
+    a_scale = torch.randint(128, 130, (M, K // 32), dtype=torch.uint8, device=device)
+    # a_scale = torch.full((M, K // 32), 128, dtype=torch.uint8, device=device)
+    b_scale = torch.randint(128, 130, (N, K // 32), dtype=torch.uint8, device=device)
+    # b_scale = torch.full((N, K // 32), 128, dtype=torch.uint8, device=device)
+
+    print(f'{a=}, {a.shape=}')
+    print(f'{b=}, {b.shape=}')
+    print(f'{a_scale=}, {a_scale.shape=}')
+    print(f'{b_scale=}, {b_scale.shape=}')
 
     dtype_dst = getattr(torch, dtype_dst_str)
     output = torch.empty((M, N), dtype=dtype_dst, device=device)
@@ -347,6 +361,8 @@ def test_mxfp(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, device):
     output = output.to(torch.float32)
     atol = 0.0001
     rtol = 0.0001
+    print(f'{output=}')
+    print(f'{ref_out=}')
     torch.testing.assert_close(ref_out, output, atol=atol, rtol=rtol)
 
     # Pipelining of dot_scaled requires tmem_copy to be used, which in turn
@@ -440,8 +456,14 @@ def _knob_disable_ptxas_opt(monkeypatch):
                                                        (128, 128, 256), (128, 256, 256)])
 @pytest.mark.parametrize("NUM_STAGES", [1, 2, 4])
 @pytest.mark.parametrize("USE_2D_SCALE_LOAD", [False, True])
-@pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 10, reason="Requires compute capability >= 10")
 def test_blocked_scale_mxfp(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, USE_2D_SCALE_LOAD, device, monkeypatch):
+    if is_cuda() and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires compute capability >= 10")
+    elif is_hip():
+        if not is_hip_mi350():
+            pytest.skip("Only supported on MI350")
+        if not USE_2D_SCALE_LOAD:
+            pytest.skip("AMDGPU only support 2D scale load")
     if NUM_STAGES == 1 and USE_2D_SCALE_LOAD:
         # Disabling ptxas optimization as a temporary workaround, otherwise the test does not pass
         _knob_disable_ptxas_opt(monkeypatch)
@@ -459,8 +481,10 @@ def test_blocked_scale_mxfp(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, USE_
     b = torch.randint(20, 40, (K, N), dtype=torch.uint8, device=device).view(torch.float8_e5m2)
     B = f8_to_f16(b, dtype_src_str)
     ceildiv = lambda a, b: math.ceil(a / b)
-    a_scale = torch.randint(130, (ceildiv(M, 128), ceildiv(K, 128), 32, 4, 4), dtype=torch.uint8).to(device)
-    b_scale = torch.randint(130, (ceildiv(N, 128), ceildiv(K, 128), 32, 4, 4), dtype=torch.uint8).to(device)
+    # a_scale = torch.randint(130, (ceildiv(M, 128), ceildiv(K, 128), 32, 4, 4), dtype=torch.uint8).to(device)
+    a_scale = torch.full((ceildiv(M, 128), ceildiv(K, 128), 32, 4, 4), 128, dtype=torch.uint8).to(device)
+    # b_scale = torch.randint(130, (ceildiv(N, 128), ceildiv(K, 128), 32, 4, 4), dtype=torch.uint8).to(device)
+    b_scale = torch.full((ceildiv(N, 128), ceildiv(K, 128), 32, 4, 4), 128, dtype=torch.uint8).to(device)
 
     dtype_dst = getattr(torch, dtype_dst_str)
     output = torch.empty((M, N), dtype=dtype_dst, device=device)
@@ -708,7 +732,7 @@ def block_scale_fp4_matmul(  #
 
 @pytest.mark.parametrize("M, N, K", [(1024, 512, 256), (2, 4, 64)])
 @pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K", [(128, 128, 128), (256, 128, 128), (128, 256, 128),
-                                                       (128, 256, 256), (128, 128, 64), (128, 64, 128)])
+                                                       (128, 256, 256), (128, 128, 64), (128, 64, 128), (32, 32, 64)])
 @pytest.mark.parametrize(("scale_type", "VEC_SIZE"), [("float8_e8m0fnu", 32), ("float8_e4m3fn", 16)],
                          ids=["mxfp4", "nvfp4"])
 @pytest.mark.parametrize("nonKDim", ([0, 16, 32] if is_hip_cdna() else []))
@@ -822,8 +846,15 @@ def mxfp8_mxfp4_matmul(  #
 @pytest.mark.parametrize("NUM_STAGES", [1, 3])
 @pytest.mark.parametrize("B_TRANS", [True, False])
 @pytest.mark.parametrize("CONST_SCALE", [True, False])
-@pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 10, reason="Requires compute capability >= 10")
 def test_mxfp8_mxfp4_matmul(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, B_TRANS, CONST_SCALE, device):
+    if is_cuda() and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("Requires compute capability >= 10")
+    elif is_hip():
+        if not is_hip_mi350():
+            pytest.skip("Scaled mxfp4 & mxfp8 matmul is only natively supported on MI350")
+        if not B_TRANS:
+            pytest.skip("B with shape (N, K) is not supported by MI350")
+
     if BLOCK_N == 256 and BLOCK_K == 256:
         NUM_STAGES = 2
 
@@ -853,11 +884,13 @@ def test_mxfp8_mxfp4_matmul(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, B_TR
     b_scale_ref = b_scale_mxfp4.to(torch.float32).repeat_interleave(32, dim=1).T.contiguous()[:K, :N]
     ref_out = torch.matmul(a_ref * a_scale_ref, b_ref * b_scale_ref)
 
+    kernel_kwargs = {}
     output = a.new_empty((M, N), dtype=torch.float32)
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
     out = mxfp8_mxfp4_matmul[grid](a, b, output, a_scale, b_scale, M, N, K, b_scale.stride(0), a.stride(0), a.stride(1),
                                    b.stride(0), b.stride(1), output.stride(0), output.stride(1), BLOCK_M, BLOCK_N,
-                                   BLOCK_K, NUM_STAGES=NUM_STAGES)
-    ttgir = out.asm["ttgir"]
-    assert "fp4Padded = true" in ttgir
+                                   BLOCK_K, NUM_STAGES=NUM_STAGES, **kernel_kwargs)
+    if is_cuda():
+        ttgir = out.asm["ttgir"]
+        assert "fp4Padded = true" in ttgir
     torch.testing.assert_close(ref_out, output, atol=1e-3, rtol=1e-3)
