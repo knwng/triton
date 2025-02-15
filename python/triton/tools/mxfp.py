@@ -40,6 +40,14 @@ class MXFP4Tensor:
         self.data = ((S << 3) | (E << 1) | M).type(torch.uint8)
         return self
 
+    def constant(self):
+        S = torch.full(self.size, 0, dtype=torch.uint8, device=self.device)
+        E = torch.full(self.size, 2, dtype=torch.uint8, device=self.device)
+        M = torch.full(self.size, 1, dtype=torch.uint8, device=self.device)
+
+        self.data = ((S << 3) | (E << 1) | M).type(torch.uint8)
+        return self
+
     def to(self, dtype):
         """
         Convert fp4e2m1 data to float32.
