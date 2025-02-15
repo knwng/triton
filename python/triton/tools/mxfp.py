@@ -40,6 +40,14 @@ class MXFP4Tensor:
         self.data = ((S << 3) | (E << 1) | M).type(torch.uint8)
         return self
 
+    def constant(self):
+        S = torch.full(self.size, 0, dtype=torch.uint8, device=self.device)
+        E = torch.full(self.size, 2, dtype=torch.uint8, device=self.device)
+        M = torch.full(self.size, 1, dtype=torch.uint8, device=self.device)
+
+        self.data = ((S << 3) | (E << 1) | M).type(torch.uint8)
+        return self
+
     def to(self, dtype):
         """
         Convert fp4e2m1 data to float32.
@@ -264,6 +272,10 @@ class MXScaleTensor:
 
         E = torch.randint(min_exponent, max_exponent + 1, size=self.size, dtype=torch.uint8, device=self.device)
         self.data = E
+        return self
+
+    def constant(self):
+        self.data = torch.full(self.size, 127, dtype=torch.uint8, device=self.device)
         return self
 
     def to(self, dtype):
