@@ -227,7 +227,8 @@ def compile(src, target=None, options=None):
     options = backend.parse_options(dict(options or dict(), **extra_options))
     # create cache manager
     env_vars = get_cache_invalidating_env_vars()
-    key = f"{triton_key()}-{src.hash()}-{backend.hash()}-{options.hash()}-{str(sorted(env_vars.items()))}"
+    # key = f"{triton_key()}-{src.hash()}-{backend.hash()}-{options.hash()}-{str(sorted(env_vars.items()))}"
+    key = f"{triton_key()}-{src.hash()}-{backend.hash()}-{options.hash()}"
     hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
     fn_cache_manager = get_cache_manager(hash)
     # For dumping/overriding only hash the source as we want it to be independent of triton
