@@ -1,7 +1,6 @@
 #include "SchedInstructions.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
 #include "TritonAMDGPUToLLVM/TargetUtils.h"
-#include "Utility.h"
 #include "mlir/Dialect/AMDGPU/IR/AMDGPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
@@ -20,7 +19,6 @@ namespace mlir::triton {
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 using namespace mlir;
-using ::mlir::LLVM::AMD::isChainDotHead;
 
 // TODO: The following passes/algorithms are applicable only for a single
 // `tt.dot` op in a `scf.for` block -i.e., a single schedule hint op per block.
@@ -427,9 +425,10 @@ struct InstructionSchedHintsRewriter
     // not supposed to be used together with IGLP OPT according to the AMDGPU
     // backend documentation.
     const bool limitSchedulingRange =
+        // schedVariant == mlir::triton::amdgpu::SchedHint::local_prefetch;
         schedVariant == mlir::triton::amdgpu::SchedHint::local_prefetch ||
         schedVariant == mlir::triton::amdgpu::SchedHint::attention;
-    ;
+
     Location loc = instructionSchedHint->getLoc();
     Block *block = instructionSchedHint->getBlock();
     if (limitSchedulingRange) {
@@ -499,6 +498,30 @@ struct TritonAMDGPULowerInstructionSchedHints
   }
 };
 
+bool hasInterleavedDotExp(mlir::triton::DotOpInterface dotOp,
+                          int expectedNumExp) {
+  auto isInSameRegion = [&dotOp](Operation *op) {
+    return op->getParentRegion() == dotOp->getParentRegion();
+  };
+  ForwardSliceOptions fwdOpt;
+  fwdOpt.filter = isInSameRegion;
+  SetVector<mlir::Operation *> fwdSlices;
+  getForwardSlice(dotOp, &fwdSlices, fwdOpt);
+  int cnt = 0;
+  for (Operation *op : fwdSlices) {
+    if (auto dOp = dyn_cast<mlir::triton::DotOpInterface>(op)) {
+      assert(dOp != dotOp);
+      auto opA = dOp.getA().getDefiningOp();
+      if (opA && fwdSlices.contains(opA)) {
+        return cnt >= expectedNumExp;
+      }
+    } else if (isa<math::Exp2Op, math::ExpOp>(op)) {
+      cnt++;
+    }
+  }
+  return false;
+}
+
 struct TritonAMDGPUInsertInstructionSchedHints
     : public triton::impl::TritonAMDGPUInsertInstructionSchedHintsBase<
           TritonAMDGPUInsertInstructionSchedHints> {
@@ -541,7 +564,7 @@ struct TritonAMDGPUInsertInstructionSchedHints
         // The attention schedule hint is inserted to the beginning of a
         // for-loop with chained dots.
         auto result = forOp->walk([](triton::DotOp op) {
-          if (isChainDotHead(op))
+          if (hasInterleavedDotExp(op, /*expectedNumExp=*/2))
             return WalkResult::interrupt();
           return WalkResult::advance();
         });
