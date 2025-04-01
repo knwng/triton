@@ -3526,7 +3526,7 @@ def get_test_dot_mfma_edge_cases():
 # M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dtype, out_dtype, kpack, mma_nonk_size
 # introduced in #3370
 def get_test_dot_fp8_output_cases():
-    return [(128, 128, 64, 4, False, False, 'chain-dot', 'ieee', float8_type, 'float32', 1, None)
+    return [(256, 128, 64, 8, False, False, 'chain-dot', 'ieee', float8_type, 'float32', 1, None)
             for float8_type in ["float8e5", "float8e4nv"]]
 
 
@@ -3704,6 +3704,9 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
         kern_kwargs['kpack'] = kpack
         if mma_nonk_size is not None:
             kern_kwargs['matrix_instr_nonkdim'] = mma_nonk_size
+        kern_kwargs["num_warps"] = 8
+        kern_kwargs["num_stages"] = 2
+        kern_kwargs["matrix_instr_nonkdim"] = 16
 
     pgm = kernel[(1, 1)](x_tri, x_tri.stride(0), x_tri.stride(1), y_tri, y_tri.stride(0), y_tri.stride(1), w_tri,
                          w_tri.stride(0), w_tri.stride(1), z_tri, z_tri.stride(0), z_tri.stride(1), **kern_kwargs)
@@ -3752,7 +3755,7 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, input_precision, in_dty
         np.testing.assert_allclose(z_ref, to_numpy(z_tri), rtol=0.01, atol=1e-2)
     else:
         # added atol, to loose precision for float16xfloat16->float32 case
-        np.testing.assert_allclose(z_ref, to_numpy(z_tri), rtol=0.01, atol=1e-3)
+        np.testing.assert_allclose(z_ref, to_numpy(z_tri) * 16, rtol=0.01, atol=1e-3)
     if not is_cuda():
         return
     # make sure ld/st are vectorized
