@@ -112,6 +112,11 @@ public:
   // number of stages as appropriate.
   void shrinkToFit();
 
+  bool insertDepsOfOp(
+      Operation *op, bool includeArg, bool insertIfEarlier,
+      llvm::function_ref<std::pair<int, CoarseSchedule::Cluster>(Operation *)>
+          getStageClusterForOp);
+
   void erase(Operation *op) { opToStageAndCluster.erase(op); }
 
   int count(Operation *op) { return opToStageAndCluster.count(op); }
