@@ -27,7 +27,7 @@ def _query_gpu_specs():
         model = output.splitlines()[1].split(",")[2]
         if model in ["0x74a9", "0x74a1"]:
             name = "AMD Instinct MI300X"
-        elif model == "0x74a5":
+        elif model == "0x74a5" or model == "0x75a0":
             name = "AMD Instinct MI325X"
         else:
             name = "AMD"
@@ -116,8 +116,10 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
 
     # -- numerics --
     optg = dict()
-    opt1 = {"swizzle_mx_scale": True} if w_dtype == "mx4" else dict()
-    opt2 = {"swizzle_mx_scale": True} if w_dtype == "mx4" else dict()
+    # opt1 = {"swizzle_mx_scale": True} if w_dtype == "mx4" else dict()
+    # opt2 = {"swizzle_mx_scale": True} if w_dtype == "mx4" else dict()
+    opt1 = {"swizzle_mx_scale": None}
+    opt2 = {"swizzle_mx_scale": None}
     wg, wg_flex, wg_mx = quantize(wg, "bf16", dev, **optg)
     w1, w1_flex, w1_mx = quantize(w1, w_dtype, dev, **opt1)
     w2, w2_flex, w2_mx = quantize(w2, w_dtype, dev, **opt2)
@@ -215,6 +217,7 @@ def roofline_mlp(batch_ranges, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_
 
 if __name__ == "__main__":
     has_native_mx4 = torch.cuda.get_device_capability(0)[0] >= 10 or get_cdna_version() == 4
+    print(f'{has_native_mx4=}')
     if SPECS is None:
         print("Current GPU has no specs provided, utilization is N/A")
     batch_ranges = [(1024, 32768, 1024)]

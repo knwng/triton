@@ -71,18 +71,24 @@ void findValidLoads(scf::ForOp forOp,
       assert(currentSharedMemoryUsage <= kMaxSharedMemory &&
              "Even without hoisting, block size is too large.");
 
-      int64_t scaleLDSUsage = getAllocSize(aScaleTy) + getAllocSize(bScaleTy);
-
       auto aScaleShape = aScaleTy.getShape();
       auto bScaleShape = bScaleTy.getShape();
 
-      // llvm::outs() << "ub: " << ub << "\n";
-      // llvm::outs() << "aScaleShape: (" << aScaleShape[0] << ", "
-      //              << aScaleShape[1] << ")\n";
-      // llvm::outs() << "bScaleShape: (" << bScaleShape[0] << ", "
-      //              << bScaleShape[1] << ")\n";
       assert((aScaleShape[1] == bScaleShape[1]) &&
              "aScale and bScale should have the same K size.");
+
+      // int64_t scaleLDSUsage = getAllocSize(aScaleTy) +
+      // getAllocSize(bScaleTy);
+      int64_t scaleLDSUsage = 0;
+      int64_t effectiveNonKDim = 0;
+      if (aScaleLoadOp) {
+        scaleLDSUsage += getAllocSize(aScaleTy);
+        effectiveNonKDim += aScaleShape[0];
+      }
+      if (bScaleLoadOp) {
+        scaleLDSUsage += getAllocSize(bScaleTy);
+        effectiveNonKDim += bScaleShape[0];
+      }
 
       int64_t expandableMemory = kMaxSharedMemory - currentSharedMemoryUsage;
       if (scaleLDSUsage >= expandableMemory) {
@@ -93,11 +99,12 @@ void findValidLoads(scf::ForOp forOp,
       // Scale is always E8M0-encoded, so its width is always 1B.
       constexpr int byteWidth = 1;
 
-      int newUpperBound = ub;
+      // int newUpperBound = ub;
+      int newUpperBound = std::min(ub, 2);
       int64_t hoistFactor = 1;
 
       auto getAlignedScaleLDSUsage = [&](int numBlocks) {
-        return (aScaleShape[0] + bScaleShape[0]) *
+        return effectiveNonKDim *
                llvm::PowerOf2Ceil(aScaleShape[1] * numBlocks) * byteWidth;
       };
 
@@ -130,9 +137,49 @@ void findValidLoads(scf::ForOp forOp,
   }
 }
 
+void findValidLoads(scf::ForOp forOp,
+                    SetVector<std::pair<Operation *, Operation *>> &validLoads,
+                    SmallVector<std::pair<int64_t, Value>> &hoistLoopSpecs,
+                    Value ub, int newUpperBound) {
+  OpBuilder builder(forOp);
+  auto loc = forOp.getLoc();
+  for (Operation &op : forOp) {
+    if (auto dotScaledOp = dyn_cast<triton::DotScaledOp>(&op)) {
+      Value aScale = dotScaledOp.getAScale();
+      Value bScale = dotScaledOp.getBScale();
+      Operation *aScaleLoadOp = getLoadOpFromScale(aScale);
+      Operation *bScaleLoadOp = getLoadOpFromScale(bScale);
+      if (!aScaleLoadOp && !bScaleLoadOp) {
+        llvm::outs() << "Can't find loadOps of both aScale and bScale;\n";
+        continue;
+      }
+
+      auto aScaleTy = dyn_cast<RankedTensorType>(aScale.getType());
+      auto bScaleTy = dyn_cast<RankedTensorType>(bScale.getType());
+      assert(isa<ttg::LinearEncodingAttr>(aScaleTy.getEncoding()) &&
+             isa<ttg::LinearEncodingAttr>(bScaleTy.getEncoding()) &&
+             "Both aScale and bScale should be linear layout.");
+
+      auto aScaleShape = aScaleTy.getShape();
+      auto bScaleShape = bScaleTy.getShape();
+
+      assert((aScaleShape[1] == bScaleShape[1]) &&
+             "aScale and bScale should have the same K size.");
+
+      Value hoistFactor = builder.create<arith::DivSIOp>(
+          loc, ub,
+          builder.create<arith::ConstantOp>(
+              loc, builder.getI32IntegerAttr(newUpperBound)));
+
+      hoistLoopSpecs.push_back({newUpperBound, hoistFactor});
+      validLoads.insert({aScaleLoadOp, bScaleLoadOp});
+    }
+  }
+}
+
 int isUpperBoundConstant(scf::ForOp forOp) {
   auto ub = forOp.getUpperBound();
-  if (auto constant = dyn_cast<arith::ConstantOp>(ub.getDefiningOp())) {
+  if (auto constant = dyn_cast_or_null<arith::ConstantOp>(ub.getDefiningOp())) {
     return cast<IntegerAttr>(constant.getValue()).getInt();
   } else {
     llvm::outs() << "Non constant upper bound??\n";
@@ -182,26 +229,70 @@ Value expandPathBcastM(Operation *bcastM, OpBuilder &builder,
   auto broadcastOp = dyn_cast<triton::BroadcastOp>(bcastM);
   assert(broadcastOp && "We are not starting with a broadcast op");
   auto bcastKParentOp = broadcastOp.getSrc().getDefiningOp();
-  auto expandDimsOp = dyn_cast<triton::ExpandDimsOp>(bcastKParentOp);
-  assert(expandDimsOp && "broadcast's parent must be a expand_dims op");
-  auto expandDimsOpParent = expandDimsOp.getSrc().getDefiningOp();
-  auto makeRangeOp = dyn_cast<triton::MakeRangeOp>(expandDimsOpParent);
-  assert(makeRangeOp && "expandDims' parent must be a make_range op");
+  // auto expandDimsOp = dyn_cast<triton::ExpandDimsOp>(bcastKParentOp);
+  // assert(expandDimsOp && "broadcast's parent must be a expand_dims op");
+  // TODO: Use backward slice to generalize
+  if (auto expandDimsOp = dyn_cast<triton::ExpandDimsOp>(bcastKParentOp)) {
+    // expandDimsOp = dyn_cast<triton::ExpandDimsOp>(bcastKParentOp);
+    auto expandDimsOpParent = expandDimsOp.getSrc().getDefiningOp();
+    auto makeRangeOp = dyn_cast<triton::MakeRangeOp>(expandDimsOpParent);
+    assert(makeRangeOp && "expandDims' parent must be a make_range op");
+    // new make_range {0, 128*ub}
+    auto newMakeRangeValue =
+        extendMakeRange(builder, makeRangeOp, hoistDimSize);
+    // new expand_dims 1x{128*ub}
+    int expandDim = expandDimsOp.getAxisAttr().getInt();
+    auto newExpandDimsValue = builder.create<triton::ExpandDimsOp>(
+        expandDimsOp.getLoc(), newMakeRangeValue, expandDim);
 
-  // new make_range {0, 128*ub}
-  auto newMakeRangeValue = extendMakeRange(builder, makeRangeOp, hoistDimSize);
-  // new expand_dims 1x{128*ub}
-  int expandDim = expandDimsOp.getAxisAttr().getInt();
-  auto newExpandDimsValue = builder.create<triton::ExpandDimsOp>(
-      expandDimsOp.getLoc(), newMakeRangeValue, expandDim);
+    // erase ops
+    // makeRangeOp.erase();
+    // expandDimsOp.erase();
 
-  // erase ops
-  // makeRangeOp.erase();
-  // expandDimsOp.erase();
+    // new broadcast
+    return extendBroadcast(builder, bcastM, /*which dim to extend*/ 1,
+                           hoistDimSize, newExpandDimsValue);
+  } else if (auto addPtrOp = dyn_cast<triton::AddPtrOp>(bcastKParentOp)) {
+    auto splatOp1 =
+        dyn_cast<triton::SplatOp>(addPtrOp.getPtr().getDefiningOp());
+    auto mulOp = dyn_cast<arith::MulIOp>(addPtrOp.getOffset().getDefiningOp());
+    auto expandDimsOp =
+        dyn_cast<triton::ExpandDimsOp>(mulOp.getLhs().getDefiningOp());
+    auto makeRangeOp =
+        dyn_cast<triton::MakeRangeOp>(expandDimsOp.getSrc().getDefiningOp());
+    auto splatOp2 = dyn_cast<triton::SplatOp>(mulOp.getRhs().getDefiningOp());
 
-  // new broadcast
-  return extendBroadcast(builder, bcastM, /*which dim to extend*/ 1,
-                         hoistDimSize, newExpandDimsValue);
+    // Expand
+    // new make_range {0, 128*ub}
+    auto newMakeRangeValue =
+        extendMakeRange(builder, makeRangeOp, hoistDimSize);
+    // new expand_dims 1x{128*ub}
+    int expandDim = expandDimsOp.getAxisAttr().getInt();
+    auto newExpandDimsValue = builder.create<triton::ExpandDimsOp>(
+        expandDimsOp.getLoc(), newMakeRangeValue, expandDim);
+
+    auto expandSplatOp = [&](triton::SplatOp splatOp) {
+      auto type = dyn_cast<RankedTensorType>(splatOp.getResult().getType());
+      auto shape = type.getShape();
+      auto newShape = {shape[0], hoistDimSize};
+      auto newType = RankedTensorType::get(newShape, type.getElementType(),
+                                           type.getEncoding());
+      return builder.create<triton::SplatOp>(splatOp.getLoc(), newType,
+                                             splatOp.getSrc());
+    };
+
+    auto newSplatOp2 = expandSplatOp(splatOp2);
+    auto newMulOp = builder.create<arith::MulIOp>(
+        mulOp.getLoc(), newExpandDimsValue, newSplatOp2);
+    auto newSplatOp1 = expandSplatOp(splatOp1);
+    auto newAddPtrOp = builder.create<triton::AddPtrOp>(
+        addPtrOp.getLoc(), newSplatOp1.getResult().getType(), newSplatOp1,
+        newMulOp);
+    return extendBroadcast(builder, bcastM, /*which dim to extend*/ 1,
+                           hoistDimSize, newAddPtrOp);
+  } else {
+    return Value();
+  }
 }
 
 Value expandPathBcastK(Operation *bcastK, OpBuilder &builder, int ub) {
@@ -249,7 +340,7 @@ Value createLocalAlloc(OpBuilder &builder, Location loc, Value loadVal,
   return builder.create<ttg::LocalAllocOp>(loc, ldsBufferType, loadVal);
 }
 
-Value hoistLoad(scf::ForOp forOp, Operation *op, int64_t newUpperBound, int ub,
+Value hoistLoad(scf::ForOp forOp, Operation *op, int64_t newUpperBound,
                 StringRef archGen) {
   triton::LoadOp loadOp = dyn_cast<triton::LoadOp>(op);
   int64_t blockKSize =
@@ -330,6 +421,7 @@ Value hoistLoad(scf::ForOp forOp, Operation *op, int64_t newUpperBound, int ub,
   // <BLOCK_M x 1> --> <BLOCK_M x {BLOCK_K*ub}>
 
   auto newBcastMVal = expandPathBcastM(bcastM, builder, hoistKSize);
+  assert(newBcastMVal && "Failed to expand BcastM");
   auto newBcastKVal =
       extendBroadcast(builder, bcastK, /*which dim to extend*/ 1, hoistKSize,
                       dyn_cast<triton::BroadcastOp>(bcastK).getSrc());
@@ -441,19 +533,27 @@ void generateOuterLoop(scf::ForOp forOp, Value aScaleLocalAllocVal,
                        Value bScaleLocalAllocVal, int64_t hoistFactor,
                        int64_t newUpperBound) {
   // Set up ops/info required to build outer loop.
-  auto aScaleLocalAllocOp =
-      llvm::cast<ttg::LocalAllocOp>(aScaleLocalAllocVal.getDefiningOp());
-  auto bScaleLocalAllocOp =
-      llvm::cast<ttg::LocalAllocOp>(bScaleLocalAllocVal.getDefiningOp());
-  auto aScaleLoadOp = dyn_cast_or_null<triton::LoadOp>(
-      getLoadOpFromScale(aScaleLocalAllocOp.getSrc()));
-  auto bScaleLoadOp = dyn_cast_or_null<triton::LoadOp>(
-      getLoadOpFromScale(bScaleLocalAllocOp.getSrc()));
-  assert(aScaleLoadOp && bScaleLoadOp &&
-         "Expected src of local alloc to be loadOp to generate outer loop.");
+  triton::LoadOp aScaleLoadOp, bScaleLoadOp;
+  ttg::LocalAllocOp aScaleLocalAllocOp, bScaleLocalAllocOp;
+  if (aScaleLocalAllocVal) {
+    auto aScaleLocalAllocOp =
+        llvm::cast<ttg::LocalAllocOp>(aScaleLocalAllocVal.getDefiningOp());
+    aScaleLoadOp = dyn_cast_or_null<triton::LoadOp>(
+        getLoadOpFromScale(aScaleLocalAllocOp.getSrc()));
+  }
+
+  if (bScaleLocalAllocVal) {
+    auto bScaleLocalAllocOp =
+        llvm::cast<ttg::LocalAllocOp>(bScaleLocalAllocVal.getDefiningOp());
+    bScaleLoadOp = dyn_cast_or_null<triton::LoadOp>(
+        getLoadOpFromScale(bScaleLocalAllocOp.getSrc()));
+  }
+  assert((aScaleLoadOp || bScaleLoadOp) &&
+         "Expect at least 1 scale's loadOp exist to generate outer loop.");
 
   int64_t hoistKSize =
-      dyn_cast<RankedTensorType>(aScaleLoadOp.getPtr().getType())
+      dyn_cast<RankedTensorType>(aScaleLoadOp ? aScaleLoadOp.getPtr().getType()
+                                              : bScaleLoadOp.getPtr().getType())
           .getShape()
           .back();
   OpBuilder builder(forOp);
@@ -471,10 +571,12 @@ void generateOuterLoop(scf::ForOp forOp, Value aScaleLocalAllocVal,
   Value newInnerUB = builder.create<arith::ConstantOp>(
       loc, builder.getI32IntegerAttr(newUpperBound));
 
-  auto createGlobalLoadLocalAlloc =
-      [&builder,
-       &hoistKSize](Location loc, triton::LoadOp loadOp, Value offsetEl,
-                    Value localAllocVal) -> std::tuple<Value, Value, Value> {
+  auto createGlobalLoadLocalAlloc = [&builder, &hoistKSize](
+                                        Location loc, triton::LoadOp loadOp,
+                                        Value offsetEl, Value localAllocVal,
+                                        IRMapping &mapping) {
+    if (!localAllocVal)
+      return;
     auto aPtr = loadOp.getPtr();
     auto aPtrTy = cast<RankedTensorType>(aPtr.getType());
     auto offsetTy = RankedTensorType::get(
@@ -489,7 +591,10 @@ void generateOuterLoop(scf::ForOp forOp, Value aScaleLocalAllocVal,
     auto newLocalAllocOp = builder.create<ttg::LocalAllocOp>(
         loc, localAllocVal.getType(), newLoadOp->getResults()[0]);
 
-    return {aPtr, newLoadOp->getResults()[0], newLocalAllocOp.getResult()};
+    mapping.map(loadOp.getResult(), newLoadOp->getResults()[0]);
+    mapping.map(localAllocVal, newLocalAllocOp.getResult());
+
+    return;
   };
 
   auto outerDimLoop = builder.create<scf::ForOp>(
@@ -499,17 +604,11 @@ void generateOuterLoop(scf::ForOp forOp, Value aScaleLocalAllocVal,
             loc, iv,
             builder.create<arith::ConstantOp>(
                 loc, builder.getI32IntegerAttr(hoistKSize)));
-        auto [aScalePtr, newAScaleLoadedVal, newAScaleLocalAllocVal] =
-            createGlobalLoadLocalAlloc(loc, aScaleLoadOp, offsetEl,
-                                       aScaleLocalAllocVal);
-        auto [bScalePtr, newBScaleLoadedVal, newBScaleLocalAllocVal] =
-            createGlobalLoadLocalAlloc(loc, bScaleLoadOp, offsetEl,
-                                       bScaleLocalAllocVal);
         IRMapping mapping;
-        mapping.map(aScaleLoadOp.getResult(), newAScaleLoadedVal);
-        mapping.map(bScaleLoadOp.getResult(), newBScaleLoadedVal);
-        mapping.map(aScaleLocalAllocVal, newAScaleLocalAllocVal);
-        mapping.map(bScaleLocalAllocVal, newBScaleLocalAllocVal);
+        createGlobalLoadLocalAlloc(loc, aScaleLoadOp, offsetEl,
+                                   aScaleLocalAllocVal, mapping);
+        createGlobalLoadLocalAlloc(loc, bScaleLoadOp, offsetEl,
+                                   bScaleLocalAllocVal, mapping);
         mapping.map(init, args[0]);
         mapping.map(aPtr, args[1]);
         mapping.map(bPtr, args[2]);
@@ -524,19 +623,128 @@ void generateOuterLoop(scf::ForOp forOp, Value aScaleLocalAllocVal,
   forOp.getResults()[0].replaceAllUsesWith(outerDimLoop.getResults()[0]);
   forOp.erase();
 
-  if (aScaleLocalAllocOp->use_empty()) {
+  if (aScaleLocalAllocOp && aScaleLocalAllocOp->use_empty()) {
     aScaleLocalAllocOp.erase();
   }
 
-  if (bScaleLocalAllocOp->use_empty()) {
+  if (bScaleLocalAllocOp && bScaleLocalAllocOp->use_empty()) {
     bScaleLocalAllocOp.erase();
   }
 
-  if (aScaleLoadOp->use_empty()) {
+  if (aScaleLoadOp && aScaleLoadOp->use_empty()) {
     aScaleLoadOp.erase();
   }
 
-  if (bScaleLoadOp->use_empty()) {
+  if (bScaleLoadOp && bScaleLoadOp->use_empty()) {
+    bScaleLoadOp.erase();
+  }
+}
+
+void generateOuterLoop(scf::ForOp forOp, Value aScaleLocalAllocVal,
+                       Value bScaleLocalAllocVal, Value hoistFactor,
+                       int64_t newUpperBound) {
+  // Set up ops/info required to build outer loop.
+  triton::LoadOp aScaleLoadOp, bScaleLoadOp;
+  ttg::LocalAllocOp aScaleLocalAllocOp, bScaleLocalAllocOp;
+  if (aScaleLocalAllocVal) {
+    auto aScaleLocalAllocOp =
+        llvm::cast<ttg::LocalAllocOp>(aScaleLocalAllocVal.getDefiningOp());
+    aScaleLoadOp = dyn_cast_or_null<triton::LoadOp>(
+        getLoadOpFromScale(aScaleLocalAllocOp.getSrc()));
+  }
+
+  if (bScaleLocalAllocVal) {
+    auto bScaleLocalAllocOp =
+        llvm::cast<ttg::LocalAllocOp>(bScaleLocalAllocVal.getDefiningOp());
+    bScaleLoadOp = dyn_cast_or_null<triton::LoadOp>(
+        getLoadOpFromScale(bScaleLocalAllocOp.getSrc()));
+  }
+  assert((aScaleLoadOp || bScaleLoadOp) &&
+         "Expect at least 1 scale's loadOp exist to generate outer loop.");
+
+  int64_t hoistKSize =
+      dyn_cast<RankedTensorType>(aScaleLoadOp ? aScaleLoadOp.getPtr().getType()
+                                              : bScaleLoadOp.getPtr().getType())
+          .getShape()
+          .back();
+  OpBuilder builder(forOp);
+  Location loc = forOp.getLoc();
+  Value lb =
+      builder.create<arith::ConstantOp>(loc, builder.getI32IntegerAttr(0));
+  Value step =
+      builder.create<arith::ConstantOp>(loc, builder.getI32IntegerAttr(1));
+  Value init = forOp.getInits()[0];
+  Value aPtr = forOp.getInits()[1];
+  Value bPtr = forOp.getInits()[2];
+  int innerUB = isUpperBoundConstant(forOp);
+  Value newInnerUB = builder.create<arith::ConstantOp>(
+      loc, builder.getI32IntegerAttr(newUpperBound));
+
+  auto createGlobalLoadLocalAlloc = [&builder, &hoistKSize](
+                                        Location loc, triton::LoadOp loadOp,
+                                        Value offsetEl, Value localAllocVal,
+                                        IRMapping &mapping) {
+    if (!localAllocVal)
+      return;
+    auto aPtr = loadOp.getPtr();
+    auto aPtrTy = cast<RankedTensorType>(aPtr.getType());
+    auto offsetTy = RankedTensorType::get(
+        aPtrTy.getShape(), builder.getIntegerType(32), aPtrTy.getEncoding());
+    Value offset = builder.create<tt::SplatOp>(loc, offsetTy, offsetEl);
+    Value newAPtr = builder.create<tt::AddPtrOp>(loc, aPtrTy, aPtr, offset);
+
+    IRMapping loadMapping;
+    loadMapping.map(aPtr, newAPtr);
+    Operation *newLoadOp = builder.clone(*loadOp.getOperation(), loadMapping);
+
+    auto newLocalAllocOp = builder.create<ttg::LocalAllocOp>(
+        loc, localAllocVal.getType(), newLoadOp->getResults()[0]);
+
+    mapping.map(loadOp.getResult(), newLoadOp->getResults()[0]);
+    mapping.map(localAllocVal, newLocalAllocOp.getResult());
+
+    return;
+  };
+
+  auto outerDimLoop = builder.create<scf::ForOp>(
+      loc, lb, hoistFactor, step, ValueRange{init, aPtr, bPtr},
+      [&](OpBuilder &b, Location loc, Value iv, ValueRange args) {
+        Value offsetEl = builder.create<arith::MulIOp>(
+            loc, iv,
+            builder.create<arith::ConstantOp>(
+                loc, builder.getI32IntegerAttr(hoistKSize)));
+        IRMapping mapping;
+        createGlobalLoadLocalAlloc(loc, aScaleLoadOp, offsetEl,
+                                   aScaleLocalAllocVal, mapping);
+        createGlobalLoadLocalAlloc(loc, bScaleLoadOp, offsetEl,
+                                   bScaleLocalAllocVal, mapping);
+        mapping.map(init, args[0]);
+        mapping.map(aPtr, args[1]);
+        mapping.map(bPtr, args[2]);
+        Operation *newInnerLoop = builder.clone(*forOp.getOperation(), mapping);
+        auto newInnerForOp = llvm::cast<scf::ForOp>(newInnerLoop);
+        newInnerForOp.setUpperBound(newInnerUB);
+        builder.create<scf::YieldOp>(loc,
+                                     ValueRange{newInnerLoop->getResults()[0],
+                                                newInnerLoop->getResults()[1],
+                                                newInnerLoop->getResults()[2]});
+      });
+  forOp.getResults()[0].replaceAllUsesWith(outerDimLoop.getResults()[0]);
+  forOp.erase();
+
+  if (aScaleLocalAllocOp && aScaleLocalAllocOp->use_empty()) {
+    aScaleLocalAllocOp.erase();
+  }
+
+  if (bScaleLocalAllocOp && bScaleLocalAllocOp->use_empty()) {
+    bScaleLocalAllocOp.erase();
+  }
+
+  if (aScaleLoadOp && aScaleLoadOp->use_empty()) {
+    aScaleLoadOp.erase();
+  }
+
+  if (bScaleLoadOp && bScaleLoadOp->use_empty()) {
     bScaleLoadOp.erase();
   }
 }
@@ -555,13 +763,16 @@ struct AggregateLoad : public TritonAMDGPUAggregateLoadBase<AggregateLoad> {
     getOperation()->walk([&](triton::DotScaledOp dotScaledOp) -> void {
       Value aScale = dotScaledOp.getAScale();
       Value bScale = dotScaledOp.getBScale();
+      if (!aScale || !bScale) {
+        return;
+      }
       // Get aScale and bScale size.
       auto aScaleType = llvm::cast<ShapedType>(aScale.getType());
       auto bScaleType = llvm::cast<ShapedType>(bScale.getType());
       assert(aScaleType.hasStaticShape() &&
-             "Expected tt.dot to have aScale as static shape.");
+             "Expected tt.dot_scaled to have aScale as static shape.");
       assert(bScaleType.hasStaticShape() &&
-             "Expected tt.dot to have bScale as static shape.");
+             "Expected tt.dot_scaled to have bScale as static shape.");
       int64_t aScaleAllocSize = getAllocSize(aScaleType);
       int64_t bScaleAllocSize = getAllocSize(bScaleType);
       totalSharedMemoryUsage += aScaleAllocSize + bScaleAllocSize;
@@ -569,12 +780,12 @@ struct AggregateLoad : public TritonAMDGPUAggregateLoadBase<AggregateLoad> {
              "Currently only support a single dot_scaled operation.");
       foundDotScaledOp = true;
     });
-    // llvm::outs() << "before: " << *getOperation() << "\n";
 
     if (!foundDotScaledOp) {
       llvm::outs() << "Didn't find dotScaledOp for AggregateLoad\n";
       return;
     }
+    llvm::outs() << "before: " << *getOperation() << "\n";
 
     // llvm::outs() << "Total smem Usage:" << totalSharedMemoryUsage << "\n";
 
@@ -583,32 +794,44 @@ struct AggregateLoad : public TritonAMDGPUAggregateLoadBase<AggregateLoad> {
     getOperation()->walk([&](scf::ForOp forOp) -> void {
       // We need K to be constant, i.e. the upper bound of the loop is a
       // constant
-      auto ub = isUpperBoundConstant(forOp);
-      if (!ub)
-        return;
+      // int ub = isUpperBoundConstant(forOp);
+      // if (!ub)
+      //   return;
+
+      auto ub = forOp.getUpperBound();
+
       SetVector<std::pair<Operation *, Operation *>> validLoads;
       // newUpperBound, hoistFactor
-      SmallVector<std::pair<int64_t, int64_t>> hoistLoopSpecs;
+      SmallVector<std::pair<int64_t, Value>> hoistLoopSpecs;
       findValidLoads(forOp, validLoads, hoistLoopSpecs, ub,
-                     totalSharedMemoryUsage);
-      // llvm::outs() << "validLoads.size(): " << validLoads.size() << "\n";
+                     /*newUpperBound*/ 2);
       for (auto [index, loadOps] : llvm::enumerate(validLoads)) {
         auto [newUpperBound, hoistFactor] = hoistLoopSpecs[index];
         auto [aScaleLoadOp, bScaleLoadOp] = loadOps;
-        auto aScaleLocalAllocValue = hoistLoad(
-            forOp, aScaleLoadOp, newUpperBound, ub, this->archGenerationName);
-        auto bScaleLocalAllocValue = hoistLoad(
-            forOp, bScaleLoadOp, newUpperBound, ub, this->archGenerationName);
-        processLoopBody(forOp, aScaleLoadOp, aScaleLocalAllocValue);
-        processLoopBody(forOp, bScaleLoadOp, bScaleLocalAllocValue);
-        if (hoistFactor > 1) {
-          generateOuterLoop(forOp, aScaleLocalAllocValue, bScaleLocalAllocValue,
-                            hoistFactor, newUpperBound);
+        Value aScaleLocalAllocValue, bScaleLocalAllocValue;
+        if (aScaleLoadOp) {
+          aScaleLocalAllocValue = hoistLoad(forOp, aScaleLoadOp, newUpperBound,
+                                            this->archGenerationName);
+          processLoopBody(forOp, aScaleLoadOp, aScaleLocalAllocValue);
         }
+
+        if (bScaleLoadOp) {
+          bScaleLocalAllocValue = hoistLoad(forOp, bScaleLoadOp, newUpperBound,
+                                            this->archGenerationName);
+          processLoopBody(forOp, bScaleLoadOp, bScaleLocalAllocValue);
+        }
+
+        generateOuterLoop(forOp, aScaleLocalAllocValue, bScaleLocalAllocValue,
+                          hoistFactor, newUpperBound);
+        // if (hoistFactor > 1) {
+        //   generateOuterLoop(forOp, aScaleLocalAllocValue,
+        //   bScaleLocalAllocValue,
+        //                     hoistFactor, newUpperBound);
+        // }
         cnt++;
       }
     });
-    // llvm::outs() << cnt << " for-loop has been modified\n";
+    llvm::outs() << cnt << " for-loop has been modified\n";
     // llvm::outs() << "after: " << *getOperation() << "\n";
   }
 };
