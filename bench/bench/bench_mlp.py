@@ -27,6 +27,8 @@ def _query_gpu_specs():
             name = "AMD Instinct MI300X"
         elif model == "0x74a5":
             name = "AMD Instinct MI325X"
+        elif model == "0x75a0":
+            name = "AMD Instinct MI350X"
         else:
             name = "AMD"
     else:
@@ -39,6 +41,8 @@ def _query_gpu_specs():
         "HGX GB200": {"MAX_TFLOPS8": 4500, "MAX_TFLOPS16": 2250, "MAX_TBPS": 8.0},
         "AMD Instinct MI300X": {"MAX_TFLOPS8": 2615, "MAX_TFLOPS16": 1307, "MAX_TBPS": 5.3},
         "AMD Instinct MI325X": {"MAX_TFLOPS8": 2615, "MAX_TFLOPS16": 1307, "MAX_TBPS": 6.0},
+        # Need to be adjusted later
+        "AMD Instinct MI350X": {"MAX_TFLOPS8": 2615, "MAX_TFLOPS16": 1307, "MAX_TBPS": 6.0},
     }
     return gpu_specs.get(name)
 
@@ -85,8 +89,10 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype,
 
     # -- numerics --
     optg = dict()
-    opt1 = {"swizzle_mx_scale": True} if w_dtype == "mx4" else dict()
-    opt2 = {"swizzle_mx_scale": True} if w_dtype == "mx4" else dict()
+    # opt1 = {"swizzle_mx_scale": True} if w_dtype == "mx4" else dict()
+    # opt2 = {"swizzle_mx_scale": True} if w_dtype == "mx4" else dict()
+    opt1 = {"swizzle_mx_scale": None}
+    opt2 = {"swizzle_mx_scale": None}
     wg, wg_flex, wg_mx = quantize(wg, "bf16", dev, **optg)
     w1, w1_flex, w1_mx = quantize(w1, w_dtype, dev, **opt1)
     w2, w2_flex, w2_mx = quantize(w2, w_dtype, dev, **opt2)
@@ -150,13 +156,12 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype,
 
 if __name__ == "__main__":
     has_native_mx4 = torch.cuda.get_device_capability(0)[0] >= 10 or get_cdna_version() == 4
+    print(f'{has_native_mx4=}')
     if SPECS is None:
         print("Current GPU has no specs provided, utilization is N/A")
     if has_native_mx4:
-        bench_mlp(8192, 8192, 8192, 1, 1, "fp8", "fp8", TP=1, EP=1, name="dense")
         bench_mlp(8192, 8192, 8192, 1, 1, "fp8", "mx4", TP=1, EP=1, name="dense")
-        bench_mlp(2048, 5120, 8192, 128, 4, "fp8", "fp8", TP=4, EP=1, name="llama4")
-        bench_mlp(2048, 5120, 8192, 128, 4, "fp8", "mx4", TP=4, EP=1, name="llama4")
+        # bench_mlp(2048, 5120, 8192, 128, 4, "fp8", "mx4", TP=4, EP=1, name="llama4")
     else:
         # bf16/fp16 x fp8 is skipped because matmul_ogs requires x and w has the
         # same type when not doing mxfp operation

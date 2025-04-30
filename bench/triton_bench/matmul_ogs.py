@@ -499,6 +499,7 @@ def matmul_ogs(x, w, bias,
     flex = precision_config.flex_ctx
     bias_stride = None if bias is None else bias.stride(0)
     num_indx = None if scatter_indx is None else scatter_indx.src_indx.shape[0]
+    # print(f'Is microscaling: {mx_ctx.weight_scale is not None}')
     (_ptma_matmul_ogs if opt_flags.is_persistent else _matmul_ogs)[(n_cta,)](
                    flex.out_data.reinterpret(memory["output"]),
                    flex.out_data.reinterpret(out0), *out0.stride(),
