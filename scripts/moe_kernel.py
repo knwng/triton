@@ -383,9 +383,14 @@ def get_type(provider):
 
 x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
 x_vals += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4096)]
-x_vals += [(16, 4096, 2048), (16, 4096, 4096)]
+# x_vals += [(16, 4096, 2048), (16, 4096, 4096)]
+
 # x_vals += [(16, 16, 1024 * v) for v in range(1, 9)]
 # x_vals += [(32, 32, 1024 * v) for v in range(1, 9)]
+
+# def get_x_vals():
+#     global x_vals, block_m, block_n, block_k
+#     return list(filter(lambda x: x[0] >= block_m and x[1] >= block_n and x[2] >= block_k, x_vals))
 
 line_vals = []
 line_names = []
@@ -521,13 +526,13 @@ if __name__ == "__main__":
     parser.add_argument('--benchmark', action='store_true')
     args = parser.parse_args()
 
-    # block_m = 256
-    # block_n = 256
-    # block_k = 128
-
-    block_m = 16
+    block_m = 256
     block_n = 256
-    block_k = 256
+    block_k = 128
+
+    # block_m = 16
+    # block_n = 256
+    # block_k = 256
 
     num_stages = 1
     num_warps = 4

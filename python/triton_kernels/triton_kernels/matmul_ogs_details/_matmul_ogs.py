@@ -108,7 +108,7 @@ def _matmul_ogs(
     pid_m, pid_n = swizzle2d(pid_mn, (grid_m - padding_m), grid_n, GROUP_M)
     # For split-k, advance to the output k slice
     if SPLIT_K > 1:
-        Y += pid_k.to( index_type) * stride_y_k
+        Y += pid_k.to(index_type) * stride_y_k
     # set masked out rows to 0
     if HAS_FUSED_SCATTER and N_EXPTS_ACT == 1:
         _zero_masked_rows(pid_m, pid_n, Y, stride_y_m, stride_y_n, N, ScatterSrcIndx, num_idxs, BLOCK_M, BLOCK_N)

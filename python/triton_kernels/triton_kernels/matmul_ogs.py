@@ -459,6 +459,8 @@ def apply_allocation(allocation: MatmulAllocation, output):
 # Triton Implementation
 # -----------------------------------------------------------------------------
 
+runonce = False
+
 def matmul_ogs(x, w, bias,
                routing_data: RoutingData | None = None,
                gather_indx: GatherIndx | None = None,

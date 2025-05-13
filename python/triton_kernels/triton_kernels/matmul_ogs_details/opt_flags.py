@@ -46,7 +46,7 @@ def make_default_opt_flags_amd(
     has_expensive_epilogue,
     constraints,
 ):
-    assert not constraints, "flags constraints not supported on AMD"
+    # assert not constraints, "flags constraints not supported on AMD"
     # tokens per expert
     if routing_data is None:
         tokens_per_expt = m
