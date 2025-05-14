@@ -45,101 +45,6 @@ Operation *getLoadOpFromScale(Value scale) {
   return nullptr;
 }
 
-// void findValidLoads(scf::ForOp forOp,
-//                     SetVector<std::pair<Operation *, Operation *>>
-//                     &validLoads, SmallVector<std::pair<int64_t, int64_t>>
-//                     &hoistLoopSpecs, int ub, int64_t totalSharedMemoryUsage)
-//                     {
-//   int64_t currentSharedMemoryUsage = totalSharedMemoryUsage;
-//   for (Operation &op : forOp) {
-//     if (auto dotScaledOp = dyn_cast<triton::DotScaledOp>(&op)) {
-//       Value aScale = dotScaledOp.getAScale();
-//       Value bScale = dotScaledOp.getBScale();
-//       Operation *aScaleLoadOp = getLoadOpFromScale(aScale);
-//       Operation *bScaleLoadOp = getLoadOpFromScale(bScale);
-//       if (!aScaleLoadOp || !bScaleLoadOp) {
-//         llvm::outs() << "Can't find loadOp of aScale or bScale;\n";
-//         continue;
-//       }
-
-//       auto aScaleTy = dyn_cast<RankedTensorType>(aScale.getType());
-//       auto bScaleTy = dyn_cast<RankedTensorType>(bScale.getType());
-//       assert(isa<ttg::LinearEncodingAttr>(aScaleTy.getEncoding()) &&
-//              isa<ttg::LinearEncodingAttr>(bScaleTy.getEncoding()) &&
-//              "Both aScale and bScale should be linear layout.");
-
-//       const int64_t kMaxSharedMemory = 163840;
-//       assert(currentSharedMemoryUsage <= kMaxSharedMemory &&
-//              "Even without hoisting, block size is too large.");
-
-//       auto aScaleShape = aScaleTy.getShape();
-//       auto bScaleShape = bScaleTy.getShape();
-
-//       assert((aScaleShape[1] == bScaleShape[1]) &&
-//              "aScale and bScale should have the same K size.");
-
-//       // int64_t scaleLDSUsage = getAllocSize(aScaleTy) +
-//       // getAllocSize(bScaleTy);
-//       int64_t scaleLDSUsage = 0;
-//       int64_t effectiveNonKDim = 0;
-//       if (aScaleLoadOp) {
-//         scaleLDSUsage += getAllocSize(aScaleTy);
-//         effectiveNonKDim += aScaleShape[0];
-//       }
-//       if (bScaleLoadOp) {
-//         scaleLDSUsage += getAllocSize(bScaleTy);
-//         effectiveNonKDim += bScaleShape[0];
-//       }
-
-//       int64_t expandableMemory = kMaxSharedMemory - currentSharedMemoryUsage;
-//       if (scaleLDSUsage >= expandableMemory) {
-//         llvm::outs() << "Already maxed out!\n";
-//         continue;
-//       }
-
-//       // Scale is always E8M0-encoded, so its width is always 1B.
-//       constexpr int byteWidth = 1;
-
-//       // int newUpperBound = ub;
-//       int newUpperBound = std::min(ub, 2);
-//       int64_t hoistFactor = 1;
-
-//       auto getAlignedScaleLDSUsage = [&](int numBlocks) {
-//         return effectiveNonKDim *
-//                llvm::PowerOf2Ceil(aScaleShape[1] * numBlocks) * byteWidth;
-//       };
-
-//       // The following binary search may fail if the overall K dimension
-//       doesn't
-//       // have enough factors of 2. But it should be fine in common cases. May
-//       // consider better algorithm if needed.
-//       //
-//       // Due to Linear Layout's requirement, the aggregated blocks need to be
-//       // power of 2. This is done by padding LDS, which may introduce LDS
-//       // overhead. Considering scales are relatively small and LDS hasn't
-//       become
-//       // the bottleneck on gfx950, this should be fine.
-//       int64_t newMemoryUsed = 0;
-//       bool foundHoistKDim = false;
-//       while (newUpperBound > 0 && newUpperBound % 2 == 0) {
-//         newMemoryUsed = getAlignedScaleLDSUsage(newUpperBound);
-//         if (newMemoryUsed < expandableMemory) {
-//           hoistFactor = ub / newUpperBound;
-//           foundHoistKDim = true;
-//           break;
-//         }
-//         newUpperBound /= 2;
-//       }
-
-//       assert(foundHoistKDim && "Cannot determine hoisted-K size.");
-
-//       hoistLoopSpecs.push_back({newUpperBound, hoistFactor});
-//       currentSharedMemoryUsage -= newMemoryUsed;
-//       validLoads.insert({aScaleLoadOp, bScaleLoadOp});
-//     }
-//   }
-// }
-
 void findValidLoads(scf::ForOp forOp,
                     SetVector<std::pair<Operation *, Operation *>> &validLoads,
                     SmallVector<std::pair<int64_t, Value>> &hoistLoopSpecs,
@@ -235,8 +140,6 @@ Value expandPathBcastM(Operation *bcastM, OpBuilder &builder,
   auto broadcastOp = dyn_cast<triton::BroadcastOp>(bcastM);
   assert(broadcastOp && "We are not starting with a broadcast op");
   auto bcastKParentOp = broadcastOp.getSrc().getDefiningOp();
-  // auto expandDimsOp = dyn_cast<triton::ExpandDimsOp>(bcastKParentOp);
-  // assert(expandDimsOp && "broadcast's parent must be a expand_dims op");
   // TODO: Use backward slice to generalize
   if (auto expandDimsOp = dyn_cast<triton::ExpandDimsOp>(bcastKParentOp)) {
     // expandDimsOp = dyn_cast<triton::ExpandDimsOp>(bcastKParentOp);
@@ -259,41 +162,83 @@ Value expandPathBcastM(Operation *bcastM, OpBuilder &builder,
     return extendBroadcast(builder, bcastM, /*which dim to extend*/ 1,
                            hoistDimSize, newExpandDimsValue);
   } else if (auto addPtrOp = dyn_cast<triton::AddPtrOp>(bcastKParentOp)) {
-    auto splatOp1 =
-        dyn_cast<triton::SplatOp>(addPtrOp.getPtr().getDefiningOp());
-    auto mulOp = dyn_cast<arith::MulIOp>(addPtrOp.getOffset().getDefiningOp());
-    auto expandDimsOp =
-        dyn_cast<triton::ExpandDimsOp>(mulOp.getLhs().getDefiningOp());
-    auto makeRangeOp =
-        dyn_cast<triton::MakeRangeOp>(expandDimsOp.getSrc().getDefiningOp());
-    auto splatOp2 = dyn_cast<triton::SplatOp>(mulOp.getRhs().getDefiningOp());
-
-    // Expand
-    // new make_range {0, 128*ub}
-    auto newMakeRangeValue =
-        extendMakeRange(builder, makeRangeOp, hoistDimSize);
-    // new expand_dims 1x{128*ub}
-    int expandDim = expandDimsOp.getAxisAttr().getInt();
-    auto newExpandDimsValue = builder.create<triton::ExpandDimsOp>(
-        expandDimsOp.getLoc(), newMakeRangeValue, expandDim);
-
     auto expandSplatOp = [&](triton::SplatOp splatOp) {
       auto type = dyn_cast<RankedTensorType>(splatOp.getResult().getType());
       auto shape = type.getShape();
-      auto newShape = {shape[0], hoistDimSize};
+      SmallVector<int64_t> newShape;
+      if (shape.size() == 1) {
+        newShape = {hoistDimSize};
+      } else {
+        newShape = {shape[0], hoistDimSize};
+      }
       auto newType = RankedTensorType::get(newShape, type.getElementType(),
                                            type.getEncoding());
       return builder.create<triton::SplatOp>(splatOp.getLoc(), newType,
                                              splatOp.getSrc());
     };
+    // %73 = tt.make_range
+    // %74 = tt.splat %72
+    // %75 = arith.addi %74, %73
+    // %76 = tt.expand_dims %75
+    // %77 = tt.splat %arg13
+    // %78 = arith.muli %76, %77
+    // %79 = tt.splat %71
+    // %80 = tt.addptr %79, %78
+    // %82 = tt.broadcast %80
+    auto splatOp1 =
+        dyn_cast<triton::SplatOp>(addPtrOp.getPtr().getDefiningOp());
+    auto mulOp = dyn_cast<arith::MulIOp>(addPtrOp.getOffset().getDefiningOp());
+    auto expandDimsOp =
+        dyn_cast<triton::ExpandDimsOp>(mulOp.getLhs().getDefiningOp());
+    int expandDim = expandDimsOp.getAxisAttr().getInt();
+    auto splatOp2 = dyn_cast<triton::SplatOp>(mulOp.getRhs().getDefiningOp());
+
+    Value newExpandDimsOp;
+    auto expandDimsSrcDef = expandDimsOp.getSrc().getDefiningOp();
+    if (auto makeRangeOp = dyn_cast<triton::MakeRangeOp>(expandDimsSrcDef)) {
+      auto newMakeRangeOp = extendMakeRange(builder, makeRangeOp, hoistDimSize);
+      // new expand_dims 1x{128*ub}
+      newExpandDimsOp = builder.create<triton::ExpandDimsOp>(
+          expandDimsOp.getLoc(), newMakeRangeOp, expandDim);
+    } else if (auto addIOp = dyn_cast<arith::AddIOp>(expandDimsSrcDef)) {
+      auto splatOp3 =
+          dyn_cast<triton::SplatOp>(addIOp.getLhs().getDefiningOp());
+      auto makeRangeOp =
+          dyn_cast<triton::MakeRangeOp>(addIOp.getRhs().getDefiningOp());
+      // Expand
+      // new make_range {0, 128*ub}
+      auto newMakeRangeOp = extendMakeRange(builder, makeRangeOp, hoistDimSize);
+
+      auto newSplatOp3 = expandSplatOp(splatOp3);
+      auto newAddIOp = builder.create<arith::AddIOp>(
+          addIOp.getLoc(), newSplatOp3, newMakeRangeOp);
+      // new expand_dims 1x{128*ub}
+      newExpandDimsOp = builder.create<triton::ExpandDimsOp>(
+          expandDimsOp.getLoc(), newAddIOp, expandDim);
+    } else {
+      auto extSIOp = dyn_cast<arith::ExtSIOp>(expandDimsSrcDef);
+      auto makeRangeOp =
+          dyn_cast<triton::MakeRangeOp>(extSIOp.getIn().getDefiningOp());
+      auto newMakeRangeOp = extendMakeRange(builder, makeRangeOp, hoistDimSize);
+
+      auto type = dyn_cast<RankedTensorType>(extSIOp.getResult().getType());
+      auto newType = RankedTensorType::get(
+          dyn_cast<RankedTensorType>(newMakeRangeOp.getType()).getShape(),
+          type.getElementType(), type.getEncoding());
+      auto newExtSIOp = builder.create<arith::ExtSIOp>(extSIOp.getLoc(),
+                                                       newType, newMakeRangeOp);
+      newExpandDimsOp = builder.create<triton::ExpandDimsOp>(
+          expandDimsOp.getLoc(), newExtSIOp, expandDim);
+    }
 
     auto newSplatOp2 = expandSplatOp(splatOp2);
-    auto newMulOp = builder.create<arith::MulIOp>(
-        mulOp.getLoc(), newExpandDimsValue, newSplatOp2);
+    auto newMulOp = builder.create<arith::MulIOp>(mulOp.getLoc(),
+                                                  newExpandDimsOp, newSplatOp2);
     auto newSplatOp1 = expandSplatOp(splatOp1);
     auto newAddPtrOp = builder.create<triton::AddPtrOp>(
         addPtrOp.getLoc(), newSplatOp1.getResult().getType(), newSplatOp1,
         newMulOp);
+
     return extendBroadcast(builder, bcastM, /*which dim to extend*/ 1,
                            hoistDimSize, newAddPtrOp);
   } else {
@@ -316,8 +261,6 @@ Value createLocalAlloc(OpBuilder &builder, Location loc, Value loadVal,
   auto tensorTy = dyn_cast<RankedTensorType>(loadVal.getType());
   SmallVector<int64_t> bufferShape(tensorTy.getShape().begin(),
                                    tensorTy.getShape().end());
-  // llvm::outs() << "bufferShape(" << bufferShape.size() << "): ("
-  //              << bufferShape[0] << ", " << bufferShape[1] << ")\n";
 
   auto isaFamily = triton::AMD::deduceISAFamily(archGen);
   const unsigned numBanks = (isaFamily == ISAFamily::CDNA4) ? 64 : 32;
@@ -447,11 +390,6 @@ Value hoistLoad(scf::ForOp forOp, Operation *op, int64_t newUpperBound,
         aPtrs->getLoc(), newBcastMVal.getType(), newBcastMVal, newBcastKVal);
   }
 
-  // llvm::outs() << "newBcastMVal: " << newBcastMVal << "\n";
-  // llvm::outs() << "newBcastKVal: " << newBcastKVal << "\n";
-  // llvm::outs() << "newPtrVal: " << newPtrVal << "\n";
-  // llvm::outs() << "newPtrVal type: " << newPtrVal.getType() << "\n";
-
   // The we create the aggregated load with the "fat" pointer
   // create: load newPtr
   Value aggregatedLoadVal;
@@ -550,120 +488,6 @@ void processLoopBody(scf::ForOp forOp, Operation *op, Value localAllocVal) {
   loadOp.erase();
 }
 
-// void generateOuterLoop(scf::ForOp forOp, Value aScaleLocalAllocVal,
-//                        Value bScaleLocalAllocVal, int64_t hoistFactor,
-//                        int64_t newUpperBound) {
-//   // Set up ops/info required to build outer loop.
-//   triton::LoadOp aScaleLoadOp, bScaleLoadOp;
-//   ttg::LocalAllocOp aScaleLocalAllocOp, bScaleLocalAllocOp;
-//   if (aScaleLocalAllocVal) {
-//     auto aScaleLocalAllocOp =
-//         llvm::cast<ttg::LocalAllocOp>(aScaleLocalAllocVal.getDefiningOp());
-//     aScaleLoadOp = dyn_cast_or_null<triton::LoadOp>(
-//         getLoadOpFromScale(aScaleLocalAllocOp.getSrc()));
-//   }
-
-//   if (bScaleLocalAllocVal) {
-//     auto bScaleLocalAllocOp =
-//         llvm::cast<ttg::LocalAllocOp>(bScaleLocalAllocVal.getDefiningOp());
-//     bScaleLoadOp = dyn_cast_or_null<triton::LoadOp>(
-//         getLoadOpFromScale(bScaleLocalAllocOp.getSrc()));
-//   }
-//   assert((aScaleLoadOp || bScaleLoadOp) &&
-//          "Expect at least 1 scale's loadOp exist to generate outer loop.");
-
-//   int64_t hoistKSize =
-//       dyn_cast<RankedTensorType>(aScaleLoadOp ?
-//       aScaleLoadOp.getPtr().getType()
-//                                               :
-//                                               bScaleLoadOp.getPtr().getType())
-//           .getShape()
-//           .back();
-//   OpBuilder builder(forOp);
-//   Location loc = forOp.getLoc();
-//   Value lb =
-//       builder.create<arith::ConstantOp>(loc, builder.getI32IntegerAttr(0));
-//   Value ub = builder.create<arith::ConstantOp>(
-//       loc, builder.getI32IntegerAttr(hoistFactor));
-//   Value step =
-//       builder.create<arith::ConstantOp>(loc, builder.getI32IntegerAttr(1));
-//   Value init = forOp.getInits()[0];
-//   Value aPtr = forOp.getInits()[1];
-//   Value bPtr = forOp.getInits()[2];
-//   int innerUB = isUpperBoundConstant(forOp);
-//   Value newInnerUB = builder.create<arith::ConstantOp>(
-//       loc, builder.getI32IntegerAttr(newUpperBound));
-
-//   auto createGlobalLoadLocalAlloc = [&builder, &hoistKSize](
-//                                         Location loc, triton::LoadOp loadOp,
-//                                         Value offsetEl, Value localAllocVal,
-//                                         IRMapping &mapping) {
-//     if (!localAllocVal)
-//       return;
-//     auto aPtr = loadOp.getPtr();
-//     auto aPtrTy = cast<RankedTensorType>(aPtr.getType());
-//     auto offsetTy = RankedTensorType::get(
-//         aPtrTy.getShape(), builder.getIntegerType(32), aPtrTy.getEncoding());
-//     Value offset = builder.create<tt::SplatOp>(loc, offsetTy, offsetEl);
-//     Value newAPtr = builder.create<tt::AddPtrOp>(loc, aPtrTy, aPtr, offset);
-
-//     IRMapping loadMapping;
-//     loadMapping.map(aPtr, newAPtr);
-//     Operation *newLoadOp = builder.clone(*loadOp.getOperation(),
-//     loadMapping);
-
-//     auto newLocalAllocOp = builder.create<ttg::LocalAllocOp>(
-//         loc, localAllocVal.getType(), newLoadOp->getResults()[0]);
-
-//     mapping.map(loadOp.getResult(), newLoadOp->getResults()[0]);
-//     mapping.map(localAllocVal, newLocalAllocOp.getResult());
-
-//     return;
-//   };
-
-//   auto outerDimLoop = builder.create<scf::ForOp>(
-//       loc, lb, ub, step, ValueRange{init, aPtr, bPtr},
-//       [&](OpBuilder &b, Location loc, Value iv, ValueRange args) {
-//         Value offsetEl = builder.create<arith::MulIOp>(
-//             loc, iv,
-//             builder.create<arith::ConstantOp>(
-//                 loc, builder.getI32IntegerAttr(hoistKSize)));
-//         IRMapping mapping;
-//         createGlobalLoadLocalAlloc(loc, aScaleLoadOp, offsetEl,
-//                                    aScaleLocalAllocVal, mapping);
-//         createGlobalLoadLocalAlloc(loc, bScaleLoadOp, offsetEl,
-//                                    bScaleLocalAllocVal, mapping);
-//         mapping.map(init, args[0]);
-//         mapping.map(aPtr, args[1]);
-//         mapping.map(bPtr, args[2]);
-//         Operation *newInnerLoop = builder.clone(*forOp.getOperation(),
-//         mapping); auto newInnerForOp = llvm::cast<scf::ForOp>(newInnerLoop);
-//         newInnerForOp.setUpperBound(newInnerUB);
-//         builder.create<scf::YieldOp>(loc,
-//                                      ValueRange{newInnerLoop->getResults()[0],
-//                                                 newInnerLoop->getResults()[1],
-//                                                 newInnerLoop->getResults()[2]});
-//       });
-//   forOp.getResults()[0].replaceAllUsesWith(outerDimLoop.getResults()[0]);
-//   forOp.erase();
-
-//   if (aScaleLocalAllocOp && aScaleLocalAllocOp->use_empty()) {
-//     aScaleLocalAllocOp.erase();
-//   }
-
-//   if (bScaleLocalAllocOp && bScaleLocalAllocOp->use_empty()) {
-//     bScaleLocalAllocOp.erase();
-//   }
-
-//   if (aScaleLoadOp && aScaleLoadOp->use_empty()) {
-//     aScaleLoadOp.erase();
-//   }
-
-//   if (bScaleLoadOp && bScaleLoadOp->use_empty()) {
-//     bScaleLoadOp.erase();
-//   }
-// }
-
 void generateOuterLoop(scf::ForOp forOp, Value aScaleLocalAllocVal,
                        Value bScaleLocalAllocVal, Value hoistFactor,
                        int64_t newUpperBound) {
@@ -700,14 +524,11 @@ void generateOuterLoop(scf::ForOp forOp, Value aScaleLocalAllocVal,
   Value init = forOp.getInits()[0];
   Value aPtr = forOp.getInits()[1];
   Value bPtr = forOp.getInits()[2];
-  // int innerUB = isUpperBoundConstant(forOp);
   auto oldStepVal =
       dyn_cast<arith::ConstantOp>(forOp.getStep().getDefiningOp());
   int innerStep = cast<IntegerAttr>(oldStepVal.getValue()).getInt();
   Value newInnerUB = builder.create<arith::ConstantOp>(
       loc, builder.getI32IntegerAttr(newUpperBound * innerStep));
-  // Value newInnerStep =
-  //     builder.create<arith::ConstantOp>(loc, builder.getI32IntegerAttr(1));
 
   auto createGlobalLoadLocalAlloc = [&builder, &hoistKSize](
                                         Location loc, triton::LoadOp loadOp,
@@ -753,7 +574,6 @@ void generateOuterLoop(scf::ForOp forOp, Value aScaleLocalAllocVal,
         Operation *newInnerLoop = builder.clone(*forOp.getOperation(), mapping);
         auto newInnerForOp = llvm::cast<scf::ForOp>(newInnerLoop);
         newInnerForOp.setUpperBound(newInnerUB);
-        // newInnerForOp.setStep(newInnerStep);
         builder.create<scf::YieldOp>(loc,
                                      ValueRange{newInnerLoop->getResults()[0],
                                                 newInnerLoop->getResults()[1],
@@ -779,7 +599,6 @@ void generateOuterLoop(scf::ForOp forOp, Value aScaleLocalAllocVal,
   }
 }
 
-// Stream Pipeline
 struct AggregateLoad : public TritonAMDGPUAggregateLoadBase<AggregateLoad> {
   AggregateLoad() = default;
   AggregateLoad(StringRef archGen, int factor) {
@@ -814,7 +633,7 @@ struct AggregateLoad : public TritonAMDGPUAggregateLoadBase<AggregateLoad> {
     });
 
     if (!foundDotScaledOp) {
-      llvm::outs() << "Didn't find dotScaledOp for AggregateLoad\n";
+      // llvm::outs() << "Didn't find dotScaledOp for AggregateLoad\n";
       return;
     }
     // llvm::outs() << "before: " << *getOperation() << "\n";
@@ -824,12 +643,6 @@ struct AggregateLoad : public TritonAMDGPUAggregateLoadBase<AggregateLoad> {
     // Do the pipelining
     size_t cnt = 0;
     getOperation()->walk([&](scf::ForOp forOp) -> void {
-      // We need K to be constant, i.e. the upper bound of the loop is a
-      // constant
-      // int ub = isUpperBoundConstant(forOp);
-      // if (!ub)
-      //   return;
-
       auto ub = forOp.getUpperBound();
 
       SetVector<std::pair<Operation *, Operation *>> validLoads;
@@ -854,11 +667,6 @@ struct AggregateLoad : public TritonAMDGPUAggregateLoadBase<AggregateLoad> {
 
         generateOuterLoop(forOp, aScaleLocalAllocValue, bScaleLocalAllocValue,
                           hoistFactor, newUpperBound);
-        // if (hoistFactor > 1) {
-        //   generateOuterLoop(forOp, aScaleLocalAllocValue,
-        //   bScaleLocalAllocValue,
-        //                     hoistFactor, newUpperBound);
-        // }
         cnt++;
       }
     });
