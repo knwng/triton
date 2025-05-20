@@ -54,6 +54,9 @@ void findValidLoads(scf::ForOp forOp,
   auto oldStepVal =
       dyn_cast<arith::ConstantOp>(forOp.getStep().getDefiningOp());
   int innerStep = cast<IntegerAttr>(oldStepVal.getValue()).getInt();
+
+  auto ubBitWidth = dyn_cast<IntegerType>(ub.getType()).getWidth();
+
   for (Operation &op : forOp) {
     if (auto dotScaledOp = dyn_cast<triton::DotScaledOp>(&op)) {
       Value aScale = dotScaledOp.getAScale();
@@ -77,10 +80,14 @@ void findValidLoads(scf::ForOp forOp,
       assert((aScaleShape[1] == bScaleShape[1]) &&
              "aScale and bScale should have the same K size.");
 
+      // cdiv
+      int extendedStep = newUpperBound * innerStep;
       Value hoistFactor = builder.create<arith::DivSIOp>(
-          loc, ub,
-          builder.create<arith::ConstantOp>(
-              loc, builder.getI32IntegerAttr(newUpperBound * innerStep)));
+          loc,
+          builder.create<arith::AddIOp>(loc, ub,
+                                        builder.create<arith::ConstantIntOp>(
+                                            loc, extendedStep - 1, ubBitWidth)),
+          builder.create<arith::ConstantIntOp>(loc, extendedStep, ubBitWidth));
 
       hoistLoopSpecs.push_back({newUpperBound, hoistFactor});
       validLoads.insert({aScaleLoadOp, bScaleLoadOp});
@@ -435,9 +442,10 @@ void processLoopBody(scf::ForOp forOp, Operation *op, Value localAllocVal) {
   // llvm::outs() << "ORIGINAL LOAD:" << loadOp << "\n";
   auto subviewShape = dyn_cast<RankedTensorType>(loadOp.getType()).getShape();
 
-  Value BLOCK_K =
-      builder.create<arith::ConstantIntOp>(loc, subviewShape[1], 32);
   auto forOpIV = forOp.getInductionVar();
+  auto loopParamsBitWidth = dyn_cast<IntegerType>(forOpIV.getType()).getWidth();
+  Value BLOCK_K = builder.create<arith::ConstantIntOp>(loc, subviewShape[1],
+                                                       loopParamsBitWidth);
   auto bufOffVal = builder.create<arith::MulIOp>(loc, forOpIV, BLOCK_K);
 
   // step 2: localBuf = memdesc_subview ldsBuffer[0, bufOff]
@@ -445,6 +453,11 @@ void processLoopBody(scf::ForOp forOp, Operation *op, Value localAllocVal) {
   Value zero = builder.create<arith::ConstantIntOp>(loc, 0, 32);
   localBufOff[0] = zero;      // along M dim
   localBufOff[1] = bufOffVal; // along K dim
+  if (loopParamsBitWidth == 64) {
+    // Should be fine to truncate in most cases
+    localBufOff[1] = builder.create<arith::TruncIOp>(
+        loc, builder.getIntegerType(32), localBufOff[1]);
+  }
 
   ttg::MemDescType allocTy = cast<ttg::MemDescType>(localAllocVal.getType());
   Attribute sharedMemorySpace =
@@ -517,52 +530,57 @@ void generateOuterLoop(scf::ForOp forOp, Value aScaleLocalAllocVal,
           .back();
   OpBuilder builder(forOp);
   Location loc = forOp.getLoc();
-  Value lb =
-      builder.create<arith::ConstantOp>(loc, builder.getI32IntegerAttr(0));
-  Value step =
-      builder.create<arith::ConstantOp>(loc, builder.getI32IntegerAttr(1));
+
+  auto loopParamsBitWidth =
+      dyn_cast<IntegerType>(hoistFactor.getType()).getWidth();
+
+  Value lb = builder.create<arith::ConstantIntOp>(loc, 0, loopParamsBitWidth);
+  Value step = builder.create<arith::ConstantIntOp>(loc, 1, loopParamsBitWidth);
   Value init = forOp.getInits()[0];
   Value aPtr = forOp.getInits()[1];
   Value bPtr = forOp.getInits()[2];
   auto oldStepVal =
       dyn_cast<arith::ConstantOp>(forOp.getStep().getDefiningOp());
   int innerStep = cast<IntegerAttr>(oldStepVal.getValue()).getInt();
-  Value newInnerUB = builder.create<arith::ConstantOp>(
-      loc, builder.getI32IntegerAttr(newUpperBound * innerStep));
+  Value newInnerUB = builder.create<arith::ConstantIntOp>(
+      loc, newUpperBound * innerStep, loopParamsBitWidth);
 
-  auto createGlobalLoadLocalAlloc = [&builder, &hoistKSize](
-                                        Location loc, triton::LoadOp loadOp,
-                                        Value offsetEl, Value localAllocVal,
-                                        IRMapping &mapping) {
-    if (!localAllocVal)
-      return;
-    auto aPtr = loadOp.getPtr();
-    auto aPtrTy = cast<RankedTensorType>(aPtr.getType());
-    auto offsetTy = RankedTensorType::get(
-        aPtrTy.getShape(), builder.getIntegerType(32), aPtrTy.getEncoding());
-    Value offset = builder.create<tt::SplatOp>(loc, offsetTy, offsetEl);
-    Value newAPtr = builder.create<tt::AddPtrOp>(loc, aPtrTy, aPtr, offset);
+  auto createGlobalLoadLocalAlloc =
+      [&builder, &hoistKSize,
+       &loopParamsBitWidth](Location loc, triton::LoadOp loadOp, Value offsetEl,
+                            Value localAllocVal, IRMapping &mapping) {
+        if (!localAllocVal)
+          return;
+        auto aPtr = loadOp.getPtr();
+        auto aPtrTy = cast<RankedTensorType>(aPtr.getType());
+        auto offsetTy = RankedTensorType::get(
+            aPtrTy.getShape(), builder.getIntegerType(loopParamsBitWidth),
+            aPtrTy.getEncoding());
+        Value offset = builder.create<tt::SplatOp>(loc, offsetTy, offsetEl);
+        Value newAPtr = builder.create<tt::AddPtrOp>(loc, aPtrTy, aPtr, offset);
 
-    IRMapping loadMapping;
-    loadMapping.map(aPtr, newAPtr);
-    Operation *newLoadOp = builder.clone(*loadOp.getOperation(), loadMapping);
+        IRMapping loadMapping;
+        loadMapping.map(aPtr, newAPtr);
+        Operation *newLoadOp =
+            builder.clone(*loadOp.getOperation(), loadMapping);
 
-    auto newLocalAllocOp = builder.create<ttg::LocalAllocOp>(
-        loc, localAllocVal.getType(), newLoadOp->getResults()[0]);
+        auto newLocalAllocOp = builder.create<ttg::LocalAllocOp>(
+            loc, localAllocVal.getType(), newLoadOp->getResults()[0]);
 
-    mapping.map(loadOp.getResult(), newLoadOp->getResults()[0]);
-    mapping.map(localAllocVal, newLocalAllocOp.getResult());
+        mapping.map(loadOp.getResult(), newLoadOp->getResults()[0]);
+        mapping.map(localAllocVal, newLocalAllocOp.getResult());
 
-    return;
-  };
+        return;
+      };
 
   auto outerDimLoop = builder.create<scf::ForOp>(
       loc, lb, hoistFactor, step, ValueRange{init, aPtr, bPtr},
       [&](OpBuilder &b, Location loc, Value iv, ValueRange args) {
         Value offsetEl = builder.create<arith::MulIOp>(
             loc, iv,
-            builder.create<arith::ConstantOp>(
-                loc, builder.getI32IntegerAttr(hoistKSize)));
+            builder.create<arith::ConstantIntOp>(
+                loc, hoistKSize,
+                dyn_cast<IntegerType>(iv.getType()).getWidth()));
         IRMapping mapping;
         createGlobalLoadLocalAlloc(loc, aScaleLoadOp, offsetEl,
                                    aScaleLocalAllocVal, mapping);
