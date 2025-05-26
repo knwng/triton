@@ -46,7 +46,6 @@ def make_default_opt_flags_amd(
     has_expensive_epilogue,
     constraints,
 ):
-    assert not constraints, "flags constraints not supported on AMD"
     # tokens per expert
     if routing_data is None:
         tokens_per_expt = m
@@ -76,19 +75,22 @@ def make_default_opt_flags_amd(
     block_n, block_k = opt_flags_amd.compute_block_nk(
         n, block_m, grid_m, num_xcds, lhs_dtype, rhs_dtype, microscaling_ctx
     )
+    if constraints.get('block_k', None):
+        block_k = constraints['block_k']
     # split_k:
-    grid_size = grid_m * ((n + block_n - 1) // block_n)
-    n_cu = torch.cuda.get_device_properties(0).multi_processor_count
-    if enforce_bitwise_invariance:
+    if constraints.get('split_k', None):
+        split_k = constraints['split_k']
+    elif enforce_bitwise_invariance:
         split_k = 1
     else:
+        grid_size = grid_m * ((n + block_n - 1) // block_n)
+        n_cu = torch.cuda.get_device_properties(0).multi_processor_count
         split_k = max(1, n_cu // grid_size)
     # w_cache_modifier:
     w_cache_modifier = ".cg" if block_m <= 32 else None
     # num_warps, num_stages
     num_warps = 2 if (m is not None and m <= 16) else 8
     num_stages = 2
-    is_persistent = False
     # AMD-specific
     target_kernel_kwargs = {"waves_per_eu": 0, "matrix_instr_nonkdim": 16, "kpack": 1}
     return OptFlags(
@@ -101,9 +103,9 @@ def make_default_opt_flags_amd(
         xcd_swizzle=xcd_swizzle,
         w_cache_modifier=w_cache_modifier,
         split_k=split_k,
-        fused_scatter=False,
-        is_persistent=is_persistent,
-        epilogue_subtile=False,
+        fused_scatter=constraints.get('fused_scatter', False),
+        is_persistent=constraints.get('is_persistent', False),
+        epilogue_subtile=constraints.get('epilogue_subtile', False),
         arch=None,
         target_kernel_kwargs=target_kernel_kwargs,
     )
