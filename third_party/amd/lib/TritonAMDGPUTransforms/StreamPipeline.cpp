@@ -1095,7 +1095,8 @@ struct PipelinePass : public TritonAMDGPUStreamPipelineBase<PipelinePass> {
     // TODO: Replace this with more stable argument/env, once we unify strategy
     // between MXFP4 and FP16.
     bool useF16BlockPingpong =
-        triton::tools::getBoolEnv("TRITON_HIP_ENABLE_F16_ASYNC_PINGPONG");
+        triton::tools::getBoolEnv("TRITON_HIP_ENABLE_F16_ASYNC_PINGPONG") &
+	(numStages < 4);
     bool useAsyncCopyOverlap =
         triton::tools::getBoolEnv("TRITON_HIP_ASYNC_COPY_OVERLAP") &
         useAsyncCopy;
