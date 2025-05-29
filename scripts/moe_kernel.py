@@ -176,6 +176,91 @@ def scaled_dot_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_scale, M, N, K: tl.constex
         tl.atomic_add(c_ptrs, c, mask=c_mask)
 
 
+@triton.jit
+def scaled_dot_manually_aggregate_kernel(a_ptr, b_ptr, c_ptr, a_scale, b_scale, M, N, K, stride_scale,  #
+                                         stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+                                         sorted_token_ids_ptr, num_valid_tokens, DTYPE_A: tl.constexpr,  #
+                                         DTYPE_B: tl.constexpr,  #
+                                         AGGREGATE_FACTOR: tl.constexpr,  #
+                                         BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+                                         BLOCK_SIZE_K: tl.constexpr, SPLIT_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr,
+                                         EVEN_K: tl.constexpr):
+    DIV_FACTOR_A: tl.constexpr = 2 if DTYPE_A == "e2m1" else 1
+    DIV_FACTOR_B: tl.constexpr = 2 if DTYPE_B == "e2m1" else 1
+
+    tl.static_assert(AGGREGATE_FACTOR == 2)
+    tl.static_assert(SPLIT_K == 1)
+    pid = tl.program_id(axis=0)
+    pid_z = tl.program_id(1)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    if GROUP_SIZE_M == 1:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+    else:
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + (pid % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+    if SPLIT_K == 1:
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        offs_ak = tl.arange(0, BLOCK_SIZE_K // DIV_FACTOR_A)
+        offs_bk = tl.arange(0, BLOCK_SIZE_K // DIV_FACTOR_B)
+    else:
+        offs_k = pid_z * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    token_mask = offs_token < num_valid_tokens
+
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))
+    offs_bn_scale = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+    a_ptrs = a_ptr + offs_token[:, None] * \
+        stride_am + offs_ak[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_bk[:, None] * \
+        stride_bk + offs_bn[None, :] * stride_bn
+    offs_scale_k = tl.arange(0, BLOCK_SIZE_K // 32 * AGGREGATE_FACTOR)
+
+    a_scale_ptr = a_scale + offs_token[:, None] * \
+        stride_scale + offs_scale_k[None, :]
+    b_scale_ptr = b_scale + \
+        offs_bn_scale[:, None] * stride_scale + offs_scale_k[None, :]
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K * AGGREGATE_FACTOR)):
+        scale_a = tl.reshape(tl.load(a_scale_ptr), (BLOCK_SIZE_M, BLOCK_SIZE_K // 32, AGGREGATE_FACTOR))
+        scale_b = tl.reshape(tl.load(b_scale_ptr), (BLOCK_SIZE_N, BLOCK_SIZE_K // 32, AGGREGATE_FACTOR))
+        scale_a0, scale_a1 = scale_a.split()
+        scale_b0, scale_b1 = scale_b.split()
+        a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+        b = tl.load(b_ptrs)
+        accumulator = tl.dot_scaled(a, scale_a0, DTYPE_A, b, scale_b0, DTYPE_B, accumulator)
+        a_ptrs += (BLOCK_SIZE_K // DIV_FACTOR_A) * SPLIT_K * stride_ak
+        b_ptrs += (BLOCK_SIZE_K // DIV_FACTOR_B) * SPLIT_K * stride_bk
+        a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+        b = tl.load(b_ptrs)
+        accumulator = tl.dot_scaled(a, scale_a1, DTYPE_A, b, scale_b1, DTYPE_B, accumulator)
+        a_ptrs += (BLOCK_SIZE_K // DIV_FACTOR_A) * SPLIT_K * stride_ak
+        b_ptrs += (BLOCK_SIZE_K // DIV_FACTOR_B) * SPLIT_K * stride_bk
+        a_scale_ptr += (BLOCK_SIZE_K // 32) * AGGREGATE_FACTOR * SPLIT_K
+        b_scale_ptr += (BLOCK_SIZE_K // 32) * AGGREGATE_FACTOR * SPLIT_K
+
+    c = accumulator.to(c_ptr.type.element_ty)
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * \
+        offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    if SPLIT_K == 1:
+        tl.store(c_ptrs, c, mask=c_mask)
+    else:
+        tl.atomic_add(c_ptrs, c, mask=c_mask)
+
+
 def gen_input(M, N, ty_name, needTrans, seed, init_type, device='cuda'):
     d_type = name_to_tl_types[ty_name]
     torch.manual_seed(seed)
@@ -258,36 +343,35 @@ def invoke_moe(a, b, c, bias, block_m, block_n, block_k, group_m, split_k, num_w
 
 def invoke_scaled_moe(a, b, c, a_scale, b_scale, bias, block_m, block_n, block_k, dtype_a, dtype_b, group_m, split_k,
                       num_warps, num_stages, waves_per_eu, mfmaInstrSize, kpack, use_bias, sorted_token_ids_ptr,
-                      num_valid_tokens):
+                      num_valid_tokens, aggregate_factor=0):
     # Check constraints.
     div_factor_a = 2 if dtype_a == 'float4' else 1
     div_factor_b = 2 if dtype_b == 'float4' else 1
 
-    # print(f'{a.shape=}, {b.shape=}, {div_factor_a=}, {div_factor_b=}')
-
     assert (a.shape[1] * div_factor_a) == (b.shape[0] * div_factor_b), "Incompatible dimensions"
-    # assert a.is_contiguous(), "Matrix A must be contiguous"
-    # assert b.is_contiguous(), "Matrix B must be contiguous"
     M, K = a.shape
     K, N = b.shape
     K *= div_factor_b
     assert a_scale.stride(0) == b_scale.stride(0)
-    # print(f'stride_scale: {a_scale.stride(0)}')
     # 1D launch kernel where each block gets its own program.
 
     dtype_converter = {'float8e5': 'e5m2', 'float8e4nv': 'e4m3', 'float4': 'e2m1'}
 
     grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n), split_k)
-    # stride_bias = bias.stride(0) if use_bias else 0
     EVEN_K = K % block_k == 0
-    # print(f'{M=}, {N=}, {K=}, {block_m=}, {block_n=}, {block_k=}')
-    scaled_dot_kernel[grid](a, b, c, a_scale, b_scale, M, N, K,
-                            b_scale.stride(0), a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0),
-                            c.stride(1), sorted_token_ids_ptr, num_valid_tokens, DTYPE_A=dtype_converter[dtype_a],
-                            DTYPE_B=dtype_converter[dtype_b], BLOCK_SIZE_M=block_m, BLOCK_SIZE_N=block_n,
-                            BLOCK_SIZE_K=block_k, GROUP_SIZE_M=group_m, SPLIT_K=split_k, num_warps=num_warps,
-                            num_stages=num_stages, waves_per_eu=waves_per_eu, matrix_instr_nonkdim=mfmaInstrSize,
-                            kpack=kpack, EVEN_K=EVEN_K)
+
+    kargs = {}
+    kernel = scaled_dot_kernel
+    if aggregate_factor > 0:
+        kargs["AGGREGATE_FACTOR"] = aggregate_factor
+        kernel = scaled_dot_manually_aggregate_kernel
+
+    kernel[grid](a, b, c, a_scale, b_scale, M, N, K, b_scale.stride(0), a.stride(0), a.stride(1), b.stride(0),
+                 b.stride(1), c.stride(0), c.stride(1), sorted_token_ids_ptr, num_valid_tokens,
+                 DTYPE_A=dtype_converter[dtype_a], DTYPE_B=dtype_converter[dtype_b], BLOCK_SIZE_M=block_m,
+                 BLOCK_SIZE_N=block_n, BLOCK_SIZE_K=block_k, GROUP_SIZE_M=group_m, SPLIT_K=split_k, num_warps=num_warps,
+                 num_stages=num_stages, waves_per_eu=waves_per_eu, matrix_instr_nonkdim=mfmaInstrSize, kpack=kpack,
+                 EVEN_K=EVEN_K, **kargs)
     return c
 
 
@@ -456,7 +540,7 @@ def benchmark(M, N, K, provider):
 
 def run_test(M, N, K, block_m, block_n, block_k, dtype_a, dtype_b, dtype_c='fp32', col_a=False, col_b=True, group_m=1,
              split_k=1, num_warps=4, num_stages=1, waves_per_eu=1, mfmaInstrSize=16, kpack=1, use_bias=False,
-             scaled=True, init_type="randn"):
+             scaled=True, init_type="randn", aggregate_factor=0):
     torch.manual_seed(42)
 
     if scaled:
@@ -486,7 +570,7 @@ def run_test(M, N, K, block_m, block_n, block_k, dtype_a, dtype_b, dtype_c='fp32
     if scaled:
         triton_output = invoke_scaled_moe(a, b, c, a_scale, b_scale, bias, block_m, block_n, block_k, dtype_a, dtype_b,
                                           group_m, split_k, num_warps, num_stages, waves_per_eu, mfmaInstrSize, kpack,
-                                          use_bias, sorted_token_ids_ptr, num_valid_tokens)
+                                          use_bias, sorted_token_ids_ptr, num_valid_tokens, aggregate_factor)
         a_fp16[(M // 2):, :] = 0
         a_scale_ref[(M // 2):, :] = 0
         torch_output = torch.matmul(a_fp16 * a_scale_ref, b_fp16 * b_scale_ref)
@@ -524,6 +608,7 @@ def run_test(M, N, K, block_m, block_n, block_k, dtype_a, dtype_b, dtype_c='fp32
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--benchmark', action='store_true')
+    parser.add_argument('--aggregate-factor', type=int, default=0)
     args = parser.parse_args()
 
     block_m = 256
@@ -546,8 +631,10 @@ if __name__ == "__main__":
         for M, N, K in x_vals:
             for dtype_a, dtype_b in (("float8e4nv", "float8e4nv"), ("float8e4nv", "float4"), ("float4", "float4")):
                 try:
+                    print(f'Running: {M=}, {N=}, {K=}')
                     run_test(M, N, K, block_m, block_n, block_k, dtype_a, dtype_b, dtype_c, num_stages=num_stages,
-                             num_warps=num_warps, waves_per_eu=waves_per_eu, mfmaInstrSize=mfmaInstrSize)
+                             num_warps=num_warps, waves_per_eu=waves_per_eu, mfmaInstrSize=mfmaInstrSize,
+                             aggregate_factor=args.aggregate_factor)
                 except Exception as e:
                     print(f'Failed test: {M=}, {N=}, {K=}, '
                           f'{block_m=}, {block_n=}, {block_k=}, '
