@@ -47,6 +47,7 @@ def get_kernels(epilogue: Epilogue):
                                          do_not_specialize=do_not_specialize)
     module._matmul_ogs = specialize(_matmul_ogs, module, spec_constants, spec_tuples,
                                     do_not_specialize=do_not_specialize)
+    # module._matmul_ogs = _matmul_ogs
     module._p_matmul_ogs = specialize(_p_matmul_ogs, module, spec_constants, spec_tuples,
                                       do_not_specialize=do_not_specialize)
     _kernels[epilogue.name] = module
@@ -459,7 +460,11 @@ def apply_allocation(allocation: MatmulAllocation, output):
 # Triton Implementation
 # -----------------------------------------------------------------------------
 
-runonce = False
+log_cnt = 0
+config_cache = {}
+# import pickle as pkl
+# with open('config_cache.pkl', 'rb') as f:
+#     config_cache = pkl.load(f)
 
 def matmul_ogs(x, w, bias,
                routing_data: RoutingData | None = None,
@@ -471,6 +476,7 @@ def matmul_ogs(x, w, bias,
                out_alpha: float | None = None,
                y: torch.Tensor | None = None,
                epilogue: Epilogue | None = None,
+               idx: int = 0
                ):
     """
     Y[:, :] = 0.
@@ -553,6 +559,30 @@ def matmul_ogs(x, w, bias,
     bias_stride = None if bias is None else bias.stride(0)
     num_indx = None if scatter_indx is None else scatter_indx.src_indx.shape[0]
     kernels = get_kernels(epilogue)
+    # if opt_flags.block_m > 64 and opt_flags.block_n > 64 and opt_flags.block_k > 64:
+    #     opt_flags.target_kernel_kwargs['aggregate_load_factor'] = 16
+    # else:
+    #     opt_flags.target_kernel_kwargs['aggregate_load_factor'] = 0
+    M = x.shape[1] if routing_data.expt_hist is None else None
+    EXPT_SIZE = expt_data.blocks.shape[0] if expt_data.blocks is not None else None
+    # key = f'{M}_{N}_{K}_{EXPT_SIZE}_{opt_flags.block_m}_{opt_flags.block_n}_{opt_flags.block_k}'
+
+    opt_flags.target_kernel_kwargs['aggregate_load_factor'] = 0
+    opt_flags.num_stages = 1
+    # if M is None:
+    #     # non-routing matmul
+    #     opt_flags.block_m = 32
+    #     opt_flags.block_n = 256
+    #     opt_flags.block_k = 128
+    EVEN_K = K % opt_flags.block_k == 0
+
+    print(f'{opt_flags=}, {M=}, {N=}, {K=}, {EXPT_SIZE=}, {EVEN_K=}')
+    # global log_cnt
+    # STEP = 1
+    # if log_cnt % STEP == 0 or log_cnt % STEP == 1 or log_cnt % STEP == 2:
+    #     print(f'{opt_flags=}, {M=}, {N=}, {K=}, {EXPT_SIZE=}')
+    # log_cnt += 1
+
     (kernels._p_matmul_ogs if opt_flags.is_persistent else kernels._matmul_ogs)[(n_cta,)](
                    flex.out_data.reinterpret(memory["output"]),
                    flex.out_data.reinterpret(out0), *out0.stride(),
@@ -572,18 +602,21 @@ def matmul_ogs(x, w, bias,
                    num_indx,
                    writeback_idxs, writeback_size,
                    expt_data.hist, expt_data.offs, expt_data.offs_sum, expt_data.blocks,
+                   EXPT_SIZE,
                    batch_size, grid_m, grid_n,
                    out_alpha,
                    *epilogue.fn_arg_values_matmul,
-                   routing_data.n_expts_tot, routing_data.n_expts_act,
-                   precision_config.max_num_imprecise_acc,
-                   precision_config.allow_tf32,
-                   precision_config.flexpoint_saturate_inf,
-                   flex.rhs_data.is_per_batch,
-                   opt_flags.block_m,
-                   opt_flags.block_n,
-                   opt_flags.block_k,
-                   opt_flags.group_m,
+                #    EPILOGUE_FN=None,
+                #    epilogue_fn_args=None,
+                   N_EXPTS_TOT=routing_data.n_expts_tot, N_EXPTS_ACT=routing_data.n_expts_act,
+                   MAX_NUM_IMPRECISE_ACC=precision_config.max_num_imprecise_acc,
+                   ALLOW_TF32=precision_config.allow_tf32,
+                   FLEXPOINT_SATURATE_INF=precision_config.flexpoint_saturate_inf,
+                   PER_BATCH_SCALE=flex.rhs_data.is_per_batch,
+                   BLOCK_M=opt_flags.block_m,
+                   BLOCK_N=opt_flags.block_n,
+                   BLOCK_K=opt_flags.block_k,
+                   GROUP_M=opt_flags.group_m,
                    XCD_SWIZZLE=opt_flags.xcd_swizzle,
                    SWIZZLE_MX=mx_ctx.swizzle_mx,
                    EPILOGUE_SUBTILE=opt_flags.epilogue_subtile,
@@ -598,7 +631,20 @@ def matmul_ogs(x, w, bias,
                    DISABLE_Y_TMA=out0.stride(-2) * out0.dtype.itemsize % 16 != 0,
                    SWAP_XW=swap_xw,
                    NUM_SMS = n_cta,
-                   **opt_flags.target_kernel_kwargs)
+                   **opt_flags.target_kernel_kwargs,
+                #    **config_cache[key]
+                   )
+    # best_config = kernels._matmul_ogs.best_config
+    # global config_cache
+    # config_cache[key] = {
+    #     'aggregate_load_factor': best_config.kwargs['aggregate_load_factor'],
+    #     'num_warps': best_config.num_warps,
+    #     'num_stages': best_config.num_stages
+    # }
+    # with open('config_cache.pkl', 'wb') as f:
+    #     pkl.dump(config_cache, f)
+    # print(f'{best_config.kwargs=}, {best_config.num_warps=}, {best_config.num_stages=}')
+
     # post-processing
     out = apply_postprocessing_features(scatter_indx, finalize_scatter_idxs, opt_flags, expt_data.offs,
                                 num_indx, precision_config, routing_data,

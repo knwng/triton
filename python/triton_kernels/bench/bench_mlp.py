@@ -19,6 +19,31 @@ else:
     cublas = None
 
 
+def apply_precision(x_tri, w_tri, bias_tri, gs0_tri, gs1_tri, precision_config):
+    flex_ctx = precision_config.flex_ctx
+
+    def apply(x, scale):
+        if scale is None:
+            # return x.clone().detach().requires_grad_(True)
+            return x.clone().detach()
+        elif scale.numel() == 1:
+            # return (x.float() * scale).detach().requires_grad_(True)
+            return (x.float() * scale).detach()
+        else:
+            assert x.ndim == 3
+            # assert scale.numel() == x.shape[0]
+            # return (x.float() * scale[:, None, None]).detach().requires_grad_(True)
+            return (x.float() * scale).detach().requires_grad_(True)
+
+    return (
+        apply(x_tri, flex_ctx.lhs_data.scale),
+        apply(w_tri, flex_ctx.rhs_data.scale),
+        apply(bias_tri, None),
+        None if gs0_tri is None else apply(gs0_tri, None),
+        None if gs1_tri is None else apply(gs1_tri, None),
+    )
+
+
 def _query_gpu_specs():
     import subprocess
     if is_hip():
@@ -27,8 +52,10 @@ def _query_gpu_specs():
         model = output.splitlines()[1].split(",")[2]
         if model in ["0x74a9", "0x74a1"]:
             name = "AMD Instinct MI300X"
-        elif model == "0x74a5" or model == "0x75a0":
+        elif model == "0x74a5":
             name = "AMD Instinct MI325X"
+        elif model == "0x75a0":
+            name = "AMD Instinct MI350X"
         else:
             name = "AMD"
     else:
@@ -41,6 +68,7 @@ def _query_gpu_specs():
         "HGX GB200": {"MAX_TFLOPS8": 4500, "MAX_TFLOPS16": 2250, "MAX_TBPS": 8.0},
         "AMD Instinct MI300X": {"MAX_TFLOPS8": 2615, "MAX_TFLOPS16": 1307, "MAX_TBPS": 5.3},
         "AMD Instinct MI325X": {"MAX_TFLOPS8": 2615, "MAX_TFLOPS16": 1307, "MAX_TBPS": 6.0},
+        "AMD Instinct MI350X": {"MAX_TFLOPS8": 2950, "MAX_TFLOPS16": 1475, "MAX_TBPS": 7.2},
     }
     return gpu_specs.get(name)
 
@@ -99,6 +127,13 @@ class PerfData:
         return max(min_t_flop, min_t_bw) / self.time
 
 
+# import pickle as pkl
+# routing_cache = {}
+# ROUTING_CACHE_FN = 'routing_cache.pkl'
+# with open(ROUTING_CACHE_FN, 'rb') as f:
+#     routing_cache = pkl.load(f)
+
+
 def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP, name):
     assert n_expts_tot % EP == 0
     assert dim2 % TP == 0
@@ -139,17 +174,48 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
     x = torch.randn((batch, dim1), device=dev)
     xg = x.to(wg.dtype if n_expts_tot > 1 else x_dtype)
     x = x.to(x_dtype)
+
+    # def round_x(x, idx):
+    #     sep_gather = False
+    #     return x.to(x_dtype).to(torch.float32) if sep_gather else x
+
+    # # round_y = lambda y: (y / y_scale).to(act_dtype).to(torch.float32) * y_scale if sep_scatter else y
+    # round_y = lambda y: y
+    # scale = lambda val, scal: val if scal is None else val / scal
+
+    # make_scalar = lambda val: torch.tensor([val], dtype=torch.float32, device=x.device)
+    # in_flex_data = lambda scale, use_flex: InFlexData(dtype=torch.float8_e5m2, scale=make_scalar(scale)
+    #                                                   ) if use_flex else InFlexData()
+    # w1_ref = upcast_from_mxfp(w1, w1_mx.weight_scale, torch.bfloat16, axis=1, swizzle_axis=None)
+    # pc1.flex_ctx.lhs_data.scale = torch.full((1,), 1, device=x.device)
+
     # run layer
     proton.start(str(fpath.with_suffix('')), hook="triton")
     for i in range(100):
         if n_expts_tot > 1:
-            logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
+            logits = matmul_ogs(xg, wg, bg, precision_config=pcg, idx=0)
             rdata, gather_indx, scatter_indx = routing(logits, n_expts_act, simulated_ep=EP)
         else:
             rdata, gather_indx, scatter_indx = None, None, None
-        x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1)
+        # routing_cache[(batch, dim1, dim2, n_expts_act, n_expts_tot, 0)] = (rdata, gather_indx, scatter_indx)
+        # # x_ref, w_ref, bias_ref, gs0_ref, gs1_ref = apply_precision(x, w1, b1, None, None, pc1)
+        # rdata, gather_indx, scatter_indx = routing_cache[(batch, dim1, dim2, n_expts_act, n_expts_tot, 0)]
+        x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, idx=1)
+
+        # ref_y = matmul_ogs_torch(x_ref, w1_ref, bias_ref,  #
+        #                         rdata, gather_indx=gather_indx, round_x=round_x, round_y=round_y)
+        # ref_y = scale(ref_y, pc1.flex_ctx.out_data.expected_scale)
+        # print(f'{ref_y=}')
+        # print(f'{x=}')
+        # assert_close(ref_y, x)
+
         x = triton_kernels.swiglu.swiglu(x, 1.0, pcs, routing_data=rdata)
-        x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2)
+        # routing_cache[(batch, dim1, dim2, n_expts_act, n_expts_tot, 1)] = x.to(torch.float32).cpu().numpy()
+        # x = x.to(x_dtype).to(dev)
+        # x = routing_cache[(batch, dim1, dim2, n_expts_act, n_expts_tot, 1)]
+        x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2, idx=2)
+    # with open(ROUTING_CACHE_FN, 'wb') as f:
+    #     pkl.dump(routing_cache, f)
     proton.finalize()
 
     # -- analyze --
@@ -173,7 +239,6 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
 def roofline_mlp(batch_ranges, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP=1, EP=1, name="",
                  verbose=True):
     from itertools import chain
-    from bisect import bisect_left
     batches = list(chain(*[range(*r) for r in batch_ranges]))
     # collect performance data
     perfs = []
@@ -200,11 +265,12 @@ def roofline_mlp(batch_ranges, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_
     max_tbps = SPECS["MAX_TBPS"]
     max_tflops = SPECS["MAX_TFLOPS8"]
     opints = [p.opint for p in perfs]
-    knee = bisect_left(opints, max_tflops / max_tbps) - 1
+    # knee = bisect_left(opints, max_tflops / max_tbps) - 1
+    knee = 3
     x_bw, x_comp = xs[:knee], xs[knee:]
     y_bw = [op * max_tbps for op in opints[:knee]]
     y_comp = [max_tflops] * len(x_comp)
-    ax.plot(x_bw, y_bw, "--", label=f"BW-bound  ({max_tbps:.0f} TB/s)")
+    ax.plot(x_bw, y_bw, "--", label=f"BW-bound  ({max_tbps:.1f} TB/s)")
     ax.plot(x_comp, y_comp, "--", label=f"Compute-bound  ({max_tflops:.0f} TFLOP/s)")
     # plot data
     ax.scatter(xs, perf, marker="+")
@@ -221,9 +287,14 @@ if __name__ == "__main__":
     if SPECS is None:
         print("Current GPU has no specs provided, utilization is N/A")
     batch_ranges = [(1024, 32768, 1024)]
+    # batch_ranges = [(16384, 32768, 1024)]
+    # batch_ranges = [(16384, 16385, 1024)]
     dense_dtypes = ["fp8", "fp8"]
     quantized_dtypes = ["fp8", "mx4"] if has_native_mx4 else ["bf16", "mx4"]
-    roofline_mlp(batch_ranges, 8192, 8192, 1, 1, *dense_dtypes, TP=1, EP=1, name="dense")
-    roofline_mlp(batch_ranges, 8192, 8192, 1, 1, *quantized_dtypes, TP=1, EP=1, name="dense")
-    roofline_mlp(batch_ranges, 5120, 8192, 128, 4, *dense_dtypes, TP=1, EP=1, name="llama4-maverick")
-    roofline_mlp(batch_ranges, 5120, 8192, 128, 4, *quantized_dtypes, TP=1, EP=1, name="llama4-maverick")
+    # roofline_mlp(batch_ranges, 8192, 8192, 1, 1, *dense_dtypes, TP=1, EP=1, name="dense")
+    # roofline_mlp(batch_ranges, 8192, 8192, 1, 1, *quantized_dtypes, TP=1, EP=1, name="dense")
+    # roofline_mlp(batch_ranges, 5120, 8192, 128, 4, *dense_dtypes, TP=1, EP=1, name="llama4-maverick")
+    # roofline_mlp(batch_ranges, 5120, 8192, 128, 4, *quantized_dtypes, TP=1, EP=1, name="llama4-maverick")
+
+    # 6144 = 2048 * 3
+    roofline_mlp(batch_ranges, 6144, 8192, 128, 4, *quantized_dtypes, TP=1, EP=1, name="llama4-maverick")

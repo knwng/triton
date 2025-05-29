@@ -248,9 +248,9 @@ Value expandPathBcastM(Operation *bcastM, OpBuilder &builder,
 
     return extendBroadcast(builder, bcastM, /*which dim to extend*/ 1,
                            hoistDimSize, newAddPtrOp);
-  } else {
-    return Value();
   }
+
+  return Value();
 }
 
 Value expandPathBcastK(Operation *bcastK, OpBuilder &builder, int ub) {

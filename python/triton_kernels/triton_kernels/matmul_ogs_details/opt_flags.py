@@ -82,11 +82,13 @@ def make_default_opt_flags_amd(
         block_k = constraints["block_k"]
     is_persistent = constraints.get("is_persistent", False)
     # split_k:
-    grid_size = grid_m * ((n + block_n - 1) // block_n)
-    n_cu = torch.cuda.get_device_properties(0).multi_processor_count
-    if enforce_bitwise_invariance:
+    if constraints.get("split_k", None) is not None:
+        split_k = constraints["split_k"]
+    elif is_persistent or enforce_bitwise_invariance:
         split_k = 1
     else:
+        grid_size = grid_m * ((n + block_n - 1) // block_n)
+        n_cu = torch.cuda.get_device_properties(0).multi_processor_count
         split_k = max(1, n_cu // grid_size)
     # w_cache_modifier:
     w_cache_modifier = ".cg" if block_m <= 32 else None

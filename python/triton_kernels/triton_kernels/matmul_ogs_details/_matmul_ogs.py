@@ -23,6 +23,13 @@ def _zero_masked_rows(
 
 
 _matmul_ogs_repr = make_matmul_repr("_matmul_ogs", [0, 1, 2])
+
+# @triton.autotune(
+#         configs=[
+#             triton.Config({'aggregate_load_factor': x}, num_warps=8, num_stages=2) for x in (0, 8, 16)
+#         ],
+#         key=['M', 'N', 'K', 'EXPT_DATA_SHAPE', 'BLOCK_M', 'BLOCK_N', 'BLOCK_K']
+# )
 @triton.jit(repr=_matmul_ogs_repr, launch_metadata=matmul_launch_metadata)
 def _matmul_ogs(
              Y, Out, stride_y_k, stride_y_z, stride_y_m, stride_y_n,
@@ -39,7 +46,7 @@ def _matmul_ogs(
              GatherIndx,
              ScatterSrcIndx, num_idxs,
              WriteBackIndx, writeback_size,
-             ExptHist, ExptOffs, ExptOffsSum, ExptData,
+             ExptHist, ExptOffs, ExptOffsSum, ExptData, EXPT_DATA_SHAPE,
              # true grid size
              batch_size, grid_m, grid_n,
              # Out scale
