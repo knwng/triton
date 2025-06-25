@@ -1,6 +1,5 @@
 from pathlib import Path
 from copy import deepcopy
-import matplotlib.pyplot as plt
 import json
 import triton.profiler as proton
 import torch
@@ -9,7 +8,6 @@ import triton_kernels.swiglu
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp, SwizzlingType
 from triton_kernels.matmul_ogs import MicroscalingCtx, matmul_ogs, PrecisionConfig, FlexCtx, FnSpecs, FusedActivation
 from triton_kernels.numerics import InFlexData
-from triton_kernels.routing import routing
 from triton_kernels.target_info import is_hip, get_cdna_version
 from dataclasses import dataclass
 
@@ -62,8 +60,8 @@ def quantize(w, dtype, dev, **opt):
                    MicroscalingCtx()
     else:
         assert dtype == "mx4", f"{dtype=}"
-        swizzle_mx_scale = opt["swizzle_mx_scale"]
-        swizzle_mx_value = opt["swizzle_mx_value"]
+        swizzle_mx_scale = opt.get("swizzle_mx_scale")
+        swizzle_mx_value = opt.get("swizzle_mx_value")
         swizzle_axis = 2 if swizzle_mx_scale else None
         w = w.to(torch.bfloat16)
         w, mx_scales, weight_scale_shape = downcast_to_mxfp(w, torch.uint8, axis=1, swizzle_axis=swizzle_axis,
@@ -159,16 +157,23 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
     xg = x.to(wg.dtype if n_expts_tot > 1 else x_dtype)
     x = x.to(x_dtype)
     # run layer
+
+    CACHE_FN = f"moe_cache_pingpong_{batch}.pt"
+    # cache = []
+    cache = torch.load(CACHE_FN, weights_only=False)
     proton.start(str(fpath.with_suffix('')), hook="triton")
     for i in range(100):
-        if n_expts_tot > 1:
-            logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
-            rdata, gather_indx, scatter_indx = routing(logits, n_expts_act, simulated_ep=EP)
-        else:
-            rdata, gather_indx, scatter_indx = None, None, None
+        # if n_expts_tot > 1:
+        #     logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
+        #     rdata, gather_indx, scatter_indx = routing(logits, n_expts_act, simulated_ep=EP)
+        # else:
+        #     rdata, gather_indx, scatter_indx = None, None, None
+        # cache = (rdata, gather_indx, scatter_indx)
+        rdata, gather_indx, scatter_indx = cache
         x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
-        x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2)
+        # x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2)
     proton.finalize()
+    # torch.save(cache, CACHE_FN)
 
     # -- analyze --
     with open(f"{fpath}") as fd:
@@ -191,7 +196,6 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
 def roofline_mlp(batch_ranges, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP=1, EP=1, name="",
                  verbose=True):
     from itertools import chain
-    from bisect import bisect_left
     batches = list(chain(*[range(*r) for r in batch_ranges]))
     # collect performance data
     perfs = []
@@ -203,36 +207,36 @@ def roofline_mlp(batch_ranges, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_
         if verbose:
             print(f"Batch: {batch}; Util: {perfs[-1].util}; TFLOPS: {perfs[-1].tflops}; TBPS: {perfs[-1].tbps}")
     print("===============================================================")
-    # machine limits
-    fig, ax = plt.subplots(figsize=(7, 5), dpi=120)
-    ax.set_xlabel("batch size (toks/expt)")
-    ax.set_ylabel("performance  [TFLOP/s]")
-    ax.set_title(f"{bench_case} roofline")
-    # add a tiny margin so points are not flush with the frame
-    xs = [batch * n_expts_act / n_expts_tot for batch in batches]
-    perf = [p.tflops for p in perfs]
-    xmin, xmax = min(xs), max(xs)
-    dx = 0.05 * (xmax - xmin) if xmax > xmin else 1.0
-    ax.set_xlim(xmin - dx, xmax + dx)
-    ax.set_ylim(100, SPECS["MAX_TFLOPS8"] + 500)
-    # plot roofline
-    max_tbps = SPECS["MAX_TBPS"]
-    max_tflops = SPECS["MAX_TFLOPS8"]
-    opints = [p.opint for p in perfs]
-    knee = bisect_left(opints, max_tflops / max_tbps) - 1
-    x_bw, x_comp = xs[:knee], xs[knee:]
-    x_bw = [x_bw[0], x_comp[0]]
-    y_bw = [opints[0] * max_tbps, max_tflops]
-    y_comp = [max_tflops] * len(x_comp)
-    ax.plot(x_bw, y_bw, "--", label=f"BW-bound  ({max_tbps:.0f} TB/s)")
-    ax.plot(x_comp, y_comp, "--", label=f"Compute-bound  ({max_tflops:.0f} TFLOP/s)")
-    # plot data
-    ax.scatter(xs, perf, marker="+")
-    ax.legend(frameon=False, loc="lower right")
-    ax.grid(True, which="both", ls=":", lw=0.5)
-    fig.tight_layout()
-    fpath = Path(f"logs/{name}/{x_dtype}-{w_dtype}-TP{TP}-EP{EP}/roofline.png")
-    plt.savefig(fpath)
+    # # machine limits
+    # fig, ax = plt.subplots(figsize=(7, 5), dpi=120)
+    # ax.set_xlabel("batch size (toks/expt)")
+    # ax.set_ylabel("performance  [TFLOP/s]")
+    # ax.set_title(f"{bench_case} roofline")
+    # # add a tiny margin so points are not flush with the frame
+    # xs = [batch * n_expts_act / n_expts_tot for batch in batches]
+    # perf = [p.tflops for p in perfs]
+    # xmin, xmax = min(xs), max(xs)
+    # dx = 0.05 * (xmax - xmin) if xmax > xmin else 1.0
+    # ax.set_xlim(xmin - dx, xmax + dx)
+    # ax.set_ylim(100, SPECS["MAX_TFLOPS8"] + 500)
+    # # plot roofline
+    # max_tbps = SPECS["MAX_TBPS"]
+    # max_tflops = SPECS["MAX_TFLOPS8"]
+    # opints = [p.opint for p in perfs]
+    # knee = bisect_left(opints, max_tflops / max_tbps) - 1
+    # x_bw, x_comp = xs[:knee], xs[knee:]
+    # x_bw = [x_bw[0], x_comp[0]]
+    # y_bw = [opints[0] * max_tbps, max_tflops]
+    # y_comp = [max_tflops] * len(x_comp)
+    # ax.plot(x_bw, y_bw, "--", label=f"BW-bound  ({max_tbps:.0f} TB/s)")
+    # ax.plot(x_comp, y_comp, "--", label=f"Compute-bound  ({max_tflops:.0f} TFLOP/s)")
+    # # plot data
+    # ax.scatter(xs, perf, marker="+")
+    # ax.legend(frameon=False, loc="lower right")
+    # ax.grid(True, which="both", ls=":", lw=0.5)
+    # fig.tight_layout()
+    # fpath = Path(f"logs/{name}/{x_dtype}-{w_dtype}-TP{TP}-EP{EP}/roofline.png")
+    # plt.savefig(fpath)
 
 
 if __name__ == "__main__":
@@ -240,10 +244,13 @@ if __name__ == "__main__":
     if SPECS is None:
         print("Current GPU has no specs provided, utilization is N/A")
     batch_ranges_dense = [(1024, 32768, 1024)]
-    batch_ranges_moe = [(128, 512, 32), (512, 32000, 128)]
+    # batch_ranges_moe = [(128, 512, 32), (512, 32000, 128)]
+    # batch_ranges_moe = [(1024, 32768, 1024)]
+    batch_ranges_moe = [(31744, 31745, 1024)]
+    # batch_ranges_moe = [(1024, 2049, 1024), (15360, 16385, 1024), (30720, 31745, 1024)]
     dense_dtypes = ["fp8", "fp8"]
     quantized_dtypes = ["fp8", "mx4"] if has_native_mx4 else ["bf16", "mx4"]
-    roofline_mlp(batch_ranges_dense, 8192, 8192, 1, 1, *dense_dtypes, TP=1, EP=1, name="dense")
-    roofline_mlp(batch_ranges_dense, 8192, 8192, 1, 1, *quantized_dtypes, TP=1, EP=1, name="dense")
+    # roofline_mlp(batch_ranges_dense, 8192, 8192, 1, 1, *dense_dtypes, TP=1, EP=1, name="dense")
+    # roofline_mlp(batch_ranges_dense, 8192, 8192, 1, 1, *quantized_dtypes, TP=1, EP=1, name="dense")
     roofline_mlp(batch_ranges_moe, 5120, 8192, 128, 4, *dense_dtypes, TP=1, EP=1, name="llama4-maverick")
-    roofline_mlp(batch_ranges_moe, 5120, 8192, 128, 4, *quantized_dtypes, TP=1, EP=1, name="llama4-maverick")
+    # roofline_mlp(batch_ranges_moe, 5120, 8192, 128, 4, *quantized_dtypes, TP=1, EP=1, name="llama4-maverick")

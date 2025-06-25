@@ -349,6 +349,16 @@ bool StreamPipeliner::createAsyncCopy(tt::LoadOp loadOp, Value alloc,
   auto sharedEncodingAttr =
       cast<ttg::SwizzledSharedEncodingAttr>(allocTy.getEncoding());
 
+  auto sharedOrder = ttg::getOrder(allocTy);
+  auto blockedOrder = ttg::getOrder(cast<RankedTensorType>(src.getType()));
+  // We cannot reorder the elements in registers so this would lower the vector
+  // size of the loads to vecSize=1, AMDCoalesceAsyncCopy will adjust the
+  // blocked layout. AsyncCopy does not work for loads smaller than 32bit so we
+  // fall back to pipeline in registers
+  if (allocTy.getElementTypeBitWidth() < 32 && sharedOrder != blockedOrder) {
+    return false;
+  }
+
   // Extract local subview from shared allocation
   Value zero = builder.create<arith::ConstantIntOp>(forOp.getLoc(), 0, 32);
   SmallVector<Value> loadOffsets(allocTy.getRank(), zero);
@@ -672,6 +682,7 @@ void StreamPipeliner::assignMemoryLayouts() {
       // Only use shared memory when feeding into a dot op.
       loadInfo.usedByDot = true;
       // If the max continugous bits we can read is < 32, buffer in registers.
+      // Skip pipeline in registers
       if (width >= 32) {
         loadInfo.sharedEncoding =
             getSharedEncIfAllUsersAreDotEnc(op->getResult(0)).value_or(nullptr);

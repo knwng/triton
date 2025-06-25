@@ -1248,8 +1248,9 @@ void Pingponger::getDotPingponged() {
     int64_t tileSize = dotSShape[0] * dotSShape[1] * aShape[1];
 
     // 256x256x256 (128xi8)
-    if (tileSize == 8388608 && aShape[0] == 256 && aShape[1] == 128 &&
-        elemWidth == 8) {
+    // if (tileSize == 8388608 && aShape[0] == 256 && aShape[1] == 128 &&
+    //     elemWidth == 8) {
+    if (true) {
       kWidth = 16;
       if (transformFP4(builder, dotSOps[0]->getLoc()).failed()) {
         LDBG("Encountered failure when trying to execute the two ping pong "
