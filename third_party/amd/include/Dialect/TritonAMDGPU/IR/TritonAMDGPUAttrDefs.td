@@ -75,12 +75,14 @@ class TritonAMDGPU_I32EnumAttr<string mnemonic, TritonAMDGPU_I32Enum enumInfo> :
 def SchedHintCaseNone : I32EnumAttrCase<"none", 0>;
 def SchedHintCaseLocalPrefetch : I32EnumAttrCase<"local_prefetch", 1>;
 def SchedHintCaseAttention : I32EnumAttrCase<"attention", 2>;
+def SchedHintCaseIGLP0 : I32EnumAttrCase<"iglp0", 3>;
 
 def TritonAMDGPU_SchedHintsEnum : TritonAMDGPU_I32Enum<
   "SchedHint", "Instruction Scheduling Hints for AMD GPUs", [
     SchedHintCaseNone,
     SchedHintCaseLocalPrefetch,
     SchedHintCaseAttention,
+    SchedHintCaseIGLP0,
   ]>;
 
 def TritonAMDGPU_SchedHintVariantAttr :

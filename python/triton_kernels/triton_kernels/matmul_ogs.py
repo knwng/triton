@@ -512,6 +512,8 @@ def apply_allocation(allocation: MatmulAllocation, output):
 # Triton Implementation
 # -----------------------------------------------------------------------------
 
+cnt = 0
+
 def matmul_ogs(x, w, bias,
                routing_data: RoutingData | None = None,
                gather_indx: GatherIndx | None = None,
@@ -610,6 +612,11 @@ def matmul_ogs(x, w, bias,
     bias_stride = None if bias is None else bias.stride(0)
     num_indx = None if scatter_indx is None else scatter_indx.src_indx.shape[0]
     kernels = get_kernels(epilogue.specs, fused_activation.specs)
+    # global cnt
+    # if cnt %100 == 0:
+    #     print(f'{opt_flags=}')
+    #     print(f'{flex.out_data.reinterpret(out0).shape}, {flex.lhs_data.reinterpret(x).shape}, {flex.rhs_data.reinterpret(w).shape}')
+    # cnt += 1
     (kernels._p_matmul_ogs if opt_flags.is_persistent else kernels._matmul_ogs)[(n_cta,)](
                    flex.out_data.reinterpret(memory["output"]),
                    flex.out_data.reinterpret(out0), *out0.stride(),

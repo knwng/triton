@@ -1,11 +1,13 @@
+import os
 import torch
 import triton
 from triton_kernels.target_info import get_cdna_version
 
 
-def compute_block_nk(n, block_m, grid_m, num_xcds, lhs_dtype, rhs_dtype, microscaling_ctx):
+def compute_block_nk(m, n, block_m, grid_m, num_xcds, lhs_dtype, rhs_dtype, microscaling_ctx):
     lhs_width = lhs_dtype.itemsize
-    rhs_width = rhs_dtype.itemsize if microscaling_ctx.weight_scale is None else 0.5
+    rhs_width = rhs_dtype.itemsize if rhs_dtype != torch.uint8 else 0.5
+    is_mxfp_weight = microscaling_ctx.weight_scale is not None
 
     # block_n:
     n_cu = torch.cuda.get_device_properties(0).multi_processor_count
@@ -19,7 +21,7 @@ def compute_block_nk(n, block_m, grid_m, num_xcds, lhs_dtype, rhs_dtype, microsc
     else:
         block_n = 128
 
-    if get_cdna_version() == 4 and block_m == 128:
+    if get_cdna_version() == 4 and block_m == 128 and not is_mxfp_weight:
         block_n = 512
 
     # block_k needs to match the cacheline size (128B)
@@ -27,6 +29,8 @@ def compute_block_nk(n, block_m, grid_m, num_xcds, lhs_dtype, rhs_dtype, microsc
 
     # TODO: block_k = 128 seems to work better for now.
     #       perhaps due to increased number of k loops to pipeline
-    if microscaling_ctx.weight_scale is not None:
+    # if microscaling_ctx.weight_scale is not None:
+    use_large_block = os.environ.get('TRITON_USE_LARGE_BLOCK', '0') == '1'
+    if is_mxfp_weight and (get_cdna_version() != 4 or (not use_large_block)):
         block_k = 128
     return block_n, block_k

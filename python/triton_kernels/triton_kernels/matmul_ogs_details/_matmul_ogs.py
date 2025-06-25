@@ -76,6 +76,24 @@ def _matmul_ogs(
              DISABLE_Y_TMA: tl.constexpr = True,
              SWAP_XW: tl.constexpr = False):
 
+    tl.assume(stride_y_k >= 0)
+    tl.assume(stride_y_z >= 0)
+    tl.assume(stride_y_m >= 0)
+    tl.assume(stride_y_n >= 0)
+    tl.assume(stride_x_z >= 0)
+    tl.assume(stride_x_m >= 0)
+    tl.assume(stride_x_k >= 0)
+    tl.assume(stride_w_e >= 0)
+    tl.assume(stride_w_k >= 0)
+    tl.assume(stride_w_n >= 0)
+    tl.assume(stride_mx_e >= 0)
+    tl.assume(stride_mx_k >= 0)
+    tl.assume(stride_mx_n >= 0)
+    tl.assume(stride_b_e >= 0)
+    tl.assume(batch_size >= 0)
+    tl.assume(grid_m >= 0)
+    tl.assume(grid_n >= 0)
+
     Y = Out  # Y is passed for the purposes of annotation; replace it with Out
     is_microscaled_format: tl.constexpr = MxScale is not None
     MX_PACK_DIVISOR: tl.constexpr = 32
@@ -105,7 +123,10 @@ def _matmul_ogs(
     HAS_FUSED_SCATTER: tl.constexpr = WriteBackIndx is not None
     index_type: tl.constexpr = tl.int64 if UPCAST_INDICES else tl.int32
 
-    total_actual_tiles = batch_size * (grid_m - padding_m) * grid_n * SPLIT_K
+    residual_m = grid_m - padding_m
+    tl.assume(residual_m >= 0)
+
+    total_actual_tiles = batch_size * residual_m * grid_n * SPLIT_K
     if padding_m > 0 and pid >= total_actual_tiles:
         tl.device_assert(batch_size == 0)
         pid_mn = pid - total_actual_tiles
@@ -121,11 +142,11 @@ def _matmul_ogs(
     pid_emnk = pid
     if XCD_SWIZZLE != 1:
         pid_emnk = xcd_swizzle(pid_emnk, total_actual_tiles, XCD_SWIZZLE)
-    pid_e = pid_emnk // ((grid_m - padding_m) * grid_n * SPLIT_K)
-    pid_mnk = pid_emnk % ((grid_m - padding_m) * grid_n * SPLIT_K)
+    pid_e = pid_emnk // (residual_m * grid_n * SPLIT_K)
+    pid_mnk = pid_emnk % (residual_m * grid_n * SPLIT_K)
     pid_k = pid_mnk % SPLIT_K
     pid_mn = pid_mnk // SPLIT_K
-    pid_m, pid_n = swizzle2d(pid_mn, (grid_m - padding_m), grid_n, GROUP_M)
+    pid_m, pid_n = swizzle2d(pid_mn, residual_m, grid_n, GROUP_M)
     # For split-k, advance to the output k slice
     if SPLIT_K > 1:
         Y += pid_k.to( index_type) * stride_y_k
@@ -206,6 +227,10 @@ def _matmul_ogs(
         offs_n_scale = tl.max_contiguous(tl.multiple_of(offs_n_scale, SCALE_BLOCK_N), SCALE_BLOCK_N)
         # K dimension must be the last dimension for the scales
         offs_k_scale = PACKED_MX_BLOCK * pid_k + tl.arange(0, PACKED_MX_BLOCK)
+        if SWIZZLE_MX_SCALE == "GFX950":
+            offs_n_scale = (pid_n * (BLOCK_N // 32) + tl.arange(0, (BLOCK_N // 32))) % N
+            SPLITK_BLOCK_SIZE: tl.constexpr = 1
+            offs_k_scale = (pid_k * (SPLITK_BLOCK_SIZE // MX_PACK_DIVISOR) * 32) + tl.arange(0, BLOCK_K // MX_PACK_DIVISOR * 32)
         MxScalePtrs = MxScale + offs_k_scale.to(index_type)[None, :] * stride_scale_k + offs_n_scale.to(index_type)[:, None] * stride_mx_n
     else:
         MxScalePtrs = None
@@ -254,6 +279,8 @@ def _matmul_ogs(
                 # Handshake with the swizzling code
                 tl.static_assert(tl.extra.cuda.num_warps() == 8, "Only 8 warps are supported for Hopper swizzling. Got %d" % tl.extra.cuda.num_warps())
                 w_scales = unswizzle_mxfp4_scale_hopper(tl.load(MxScalePtrs), num_warps=8)
+            elif SWIZZLE_MX_SCALE == "GFX950":
+                w_scales = tl.reshape(tl.load(MxScalePtrs), (BLOCK_N, MX_SCALE_BLOCK_K))
             else:
                 w_scales = tl.load(MxScalePtrs, mask=mask_k_scale[None, :], other=0.0)
 

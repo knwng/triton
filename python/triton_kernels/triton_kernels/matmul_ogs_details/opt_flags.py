@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import triton
 from triton_kernels.numerics_details.mxfp import SwizzlingType
+from triton_kernels.target_info import get_cdna_version
 import torch
 
 from . import opt_flags_amd, opt_flags_nvidia
@@ -55,11 +56,14 @@ def make_default_opt_flags_amd(
     else:
         tokens_per_expt = routing_data.expected_tokens_per_expt
     # block_m
+    is_cdna4 = get_cdna_version() == 4
     if constraints.get("block_m", None):
         block_m = constraints["block_m"]
     elif enforce_bitwise_invariance:
-        block_m = 128
+        block_m = 256 if is_cdna4 else 128
     elif tokens_per_expt >= 512 and n >= 2048:
+        block_m = 256 if is_cdna4 else 128
+    elif is_cdna4 and m >= 512:
         block_m = 128
     else:
         block_m = max(32, min(triton.next_power_of_2(tokens_per_expt), 64))
@@ -74,7 +78,7 @@ def make_default_opt_flags_amd(
     xcd_swizzle = num_xcds
     # block_nk:
     block_n, block_k = opt_flags_amd.compute_block_nk(
-        n, block_m, grid_m, num_xcds, lhs_dtype, rhs_dtype, microscaling_ctx
+        m, n, block_m, grid_m, num_xcds, lhs_dtype, rhs_dtype, microscaling_ctx
     )
     # split_k:
     grid_size = grid_m * ((n + block_n - 1) // block_n)
@@ -90,7 +94,11 @@ def make_default_opt_flags_amd(
     num_stages = 2
     is_persistent = False
     # AMD-specific
-    target_kernel_kwargs = {"waves_per_eu": 0, "matrix_instr_nonkdim": 16, "kpack": 1}
+    # print(f'{m=}, {n=}, {k=}')
+    target_kernel_kwargs = {"waves_per_eu": 0, "matrix_instr_nonkdim": 16, "kpack": 1, "schedule_hint": "iglp0"}
+    # target_kernel_kwargs = {"waves_per_eu": 0, "matrix_instr_nonkdim": 16, "kpack": 1}
+    # if m >= 14336:
+    #     target_kernel_kwargs['schedule_hint'] = 'iglp0'
     return OptFlags(
         block_m=block_m,
         block_n=block_n,

@@ -298,6 +298,7 @@ def _upcast_from_mxfp(out_ptr, stride_o_outer, stride_o_quant: tl.constexpr,
 class SwizzlingType(Enum):
     HOPPER = 0
     BLACKWELL = 1
+    GFX950 = 2
 
 
 class DequantScaleRoundingMode(Enum):
@@ -426,6 +427,12 @@ def downcast_to_mxfp_impl(src_tensor: torch.Tensor, out_quant_type: torch.dtype,
 
     return out_quant_tensor, out_scale
 
+def swizzle_mxfp4_scale_gfx950(scale):
+    E, M, SCALE_K = scale.shape
+    scale = scale.view(E, M // 32, 2, 16, SCALE_K // 8, 2, 4, 1)
+    scale = scale.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
+    return scale.reshape(E, M // 32, SCALE_K * 32)
+
 def downcast_to_mxfp(src_tensor: torch.Tensor, out_quant_type: torch.dtype, axis: int, swizzle_axis: int | None = None,
                      swizzle_value: SwizzlingType | None = None, swizzle_scale: SwizzlingType | None = None,
                      out_quant_tensor: torch.Tensor | None = None, out_scale: torch.Tensor | None = None,
@@ -483,6 +490,8 @@ def downcast_to_mxfp(src_tensor: torch.Tensor, out_quant_type: torch.dtype, axis
         scale = swizzle_mx_scale_bw(scale, allow_pad=True)
     elif swizzle_scale == SwizzlingType.HOPPER:
         scale = swizzle_mxfp4_scale_hopper(scale, num_warps=8)
+    elif swizzle_scale == SwizzlingType.GFX950:
+        scale = swizzle_mxfp4_scale_gfx950(scale)
     assert scale.is_contiguous()
     scale = perm_tensor_from_contig(scale, axis, swizzle_axis)
 

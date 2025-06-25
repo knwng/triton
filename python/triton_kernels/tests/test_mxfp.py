@@ -114,7 +114,7 @@ def test_mxfp_swizzle(shape: tuple[int, ...]):
 @pytest.mark.parametrize("swizzle_value, swizzle_scale", [(None, None), (SwizzlingType.HOPPER, None),
                                                           (None, SwizzlingType.HOPPER),
                                                           (SwizzlingType.HOPPER, SwizzlingType.HOPPER),
-                                                          (None, SwizzlingType.BLACKWELL)])
+                                                          (None, SwizzlingType.BLACKWELL), (None, SwizzlingType.GFX950)])
 def test_mxfp_casting(
     shape: tuple[int, ...],
     axis: int,

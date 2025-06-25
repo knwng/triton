@@ -122,6 +122,15 @@ triton::DotOp getSingleDotOpIfExists(scf::ForOp forOp) {
   return (dotCounter == 1) ? dotOp : nullptr;
 }
 
+triton::DotScaledOp getSingleDotScaledOpIfExists(scf::ForOp forOp) {
+  triton::DotScaledOp dotOp = nullptr;
+  size_t dotCounter = 0;
+  forOp->walk(
+      [&dotOp, &dotCounter](triton::DotScaledOp op) { dotOp = op, ++dotCounter; });
+
+  return (dotCounter == 1) ? dotOp : nullptr;
+}
+
 // The AMDGPU compiler backend can fold consecutive `ds_read/ds_write`
 // instructions into wider variants as a part of its load/store optimization
 // during the instruction selection pass. If it happens, then it means that
@@ -428,7 +437,7 @@ struct InstructionSchedHintsRewriter
     // backend documentation.
     const bool limitSchedulingRange =
         schedVariant == mlir::triton::amdgpu::SchedHint::local_prefetch ||
-        schedVariant == mlir::triton::amdgpu::SchedHint::attention;
+        schedVariant == mlir::triton::amdgpu::SchedHint::attention || schedVariant == mlir::triton::amdgpu::SchedHint::iglp0;
     ;
     Location loc = instructionSchedHint->getLoc();
     Block *block = instructionSchedHint->getBlock();
@@ -446,6 +455,9 @@ struct InstructionSchedHintsRewriter
       break;
     case mlir::triton::amdgpu::SchedHint::attention:
       createIglpOpt(rewriter, loc, 2);
+      break;
+    case mlir::triton::amdgpu::SchedHint::iglp0:
+      createIglpOpt(rewriter, loc, 0);
       break;
     case mlir::triton::amdgpu::SchedHint::none:
     default:
@@ -510,6 +522,7 @@ struct TritonAMDGPUInsertInstructionSchedHints
   void runOnOperation() override {
     MLIRContext *ctx = &getContext();
     ModuleOp mod = getOperation();
+    // llvm::outs() << "TritonAMDGPUInsertInstructionSchedHints: " << mod << "\n";
 
     auto schedHint = mlir::triton::amdgpu::SchedHint::none;
     std::transform(variant.begin(), variant.end(), variant.begin(),
@@ -529,6 +542,19 @@ struct TritonAMDGPUInsertInstructionSchedHints
         // a single `tt.dot` op in a `scf::ForOp` scope in the current
         // implementation.
         if (auto dotOp = getSingleDotOpIfExists(forOp)) {
+          OpBuilder rewriter(ctx);
+          rewriter.setInsertionPointAfter(dotOp);
+          rewriter.create<triton::amdgpu::InstructionSchedHint>(dotOp->getLoc(),
+                                                                schedHint);
+        }
+      });
+      break;
+    case mlir::triton::amdgpu::SchedHint::iglp0:
+      mod.walk([&](scf::ForOp forOp) {
+        // Note, instruction schedule barriers are inserted only in the case of
+        // a single `tt.dot` op in a `scf::ForOp` scope in the current
+        // implementation.
+        if (auto dotOp = getSingleDotScaledOpIfExists(forOp)) {
           OpBuilder rewriter(ctx);
           rewriter.setInsertionPointAfter(dotOp);
           rewriter.create<triton::amdgpu::InstructionSchedHint>(dotOp->getLoc(),
