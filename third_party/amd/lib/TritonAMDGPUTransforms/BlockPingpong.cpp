@@ -1113,6 +1113,8 @@ LogicalResult Pingponger::transformFP4(OpBuilder &builder, Location loc) {
     moveOpAndPredecessorsUpSameBlock(cop);
   for (auto glop : gLoadOps)
     moveOpAndPredecessorsUpSameBlock(glop);
+  for (auto llop : lLoadOps)
+    moveOpAndPredecessorsUpSameBlock(llop);
 
   appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
   appendOp(builder.create<ROCDL::SBarrierOp>(loc));

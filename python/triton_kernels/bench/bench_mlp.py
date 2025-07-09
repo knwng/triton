@@ -168,21 +168,21 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
     x = x.to(x_dtype)
     # run layer
 
-    # CACHE_FN = f"moe_cache_pingpong_{w_dtype}_{batch}.pt"
+    CACHE_FN = f"moe_cache_pingpong_{w_dtype}_{batch}.pt"
     cache = []
-    # cache = torch.load(CACHE_FN, weights_only=False)
-    proton.start(str(fpath.with_suffix('')), hook="triton")
+    cache = torch.load(CACHE_FN, weights_only=False)
+    # proton.start(str(fpath.with_suffix('')), hook="triton")
     for i in range(100):
-        if n_expts_tot > 1:
-            logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
-            rdata, gather_indx, scatter_indx = routing(logits, n_expts_act, simulated_ep=EP)
-        else:
-            rdata, gather_indx, scatter_indx = None, None, None
+        # if n_expts_tot > 1:
+        #     logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
+        #     rdata, gather_indx, scatter_indx = routing(logits, n_expts_act, simulated_ep=EP)
+        # else:
+        #     rdata, gather_indx, scatter_indx = None, None, None
         # cache = (rdata, gather_indx, scatter_indx)
-        # rdata, gather_indx, scatter_indx = cache
+        rdata, gather_indx, scatter_indx = cache
         x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
-        x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2)
-    proton.finalize()
+        # x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2)
+    # proton.finalize()
     # torch.save(cache, CACHE_FN)
 
     # -- analyze --
@@ -222,10 +222,10 @@ def roofline_mlp(batch_ranges, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_
         # if batch <= 16384:
         #     for k in envs.keys():
         #         os.environ[k] = '0'
-        # if batch < 16384:
-        #     os.environ['TRITON_USE_LARGE_BLOCK'] = '1'
+        if batch < 16384 and w_dtype == 'mx4':
+            os.environ['TRITON_USE_LARGE_BLOCK'] = '1'
         perfs += [bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP, name)]
-        # os.environ['TRITON_USE_LARGE_BLOCK'] = '0'
+        os.environ['TRITON_USE_LARGE_BLOCK'] = '0'
         # for k, v in envs.items():
         #     os.environ[k] = v
         if verbose:
@@ -269,8 +269,8 @@ if __name__ == "__main__":
         print("Current GPU has no specs provided, utilization is N/A")
     batch_ranges_dense = [(1024, 32768, 1024)]
     # batch_ranges_moe = [(128, 512, 32), (512, 32000, 128)]
-    batch_ranges_moe = [(1024, 32768, 1024)]
-    # batch_ranges_moe = [(31744, 31745, 1024)]
+    # batch_ranges_moe = [(1024, 32768, 1024)]
+    batch_ranges_moe = [(31744, 31745, 1024)]
     # batch_ranges_moe = [(15360, 15361, 1024)]
     # batch_ranges_moe = [(16384, 16385, 1024)]
     # batch_ranges_moe = [(1024, 2049, 1024), (15360, 16385, 1024), (30720, 31745, 1024)]
@@ -278,5 +278,5 @@ if __name__ == "__main__":
     quantized_dtypes = ["fp8", "mx4"] if has_native_mx4 else ["bf16", "mx4"]
     # roofline_mlp(batch_ranges_dense, 8192, 8192, 1, 1, *dense_dtypes, TP=1, EP=1, name="dense")
     # roofline_mlp(batch_ranges_dense, 8192, 8192, 1, 1, *quantized_dtypes, TP=1, EP=1, name="dense")
-    roofline_mlp(batch_ranges_moe, 5120, 8192, 128, 4, *dense_dtypes, TP=1, EP=1, name="llama4-maverick")
-    # roofline_mlp(batch_ranges_moe, 5120, 8192, 128, 4, *quantized_dtypes, TP=1, EP=1, name="llama4-maverick")
+    # roofline_mlp(batch_ranges_moe, 5120, 8192, 128, 4, *dense_dtypes, TP=1, EP=1, name="llama4-maverick")
+    roofline_mlp(batch_ranges_moe, 5120, 8192, 128, 4, *quantized_dtypes, TP=1, EP=1, name="llama4-maverick")

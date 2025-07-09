@@ -282,6 +282,22 @@ class HIPBackend(BaseBackend):
             amd.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         pm.run(mod)
+
+        import os
+        if "AMD_INSERT_TTGIR" in os.environ.keys():
+            fn = os.environ['AMD_INSERT_TTGIR']
+            if ':' in fn:
+                kernel_name, insert_module_path = fn.split(':')
+                print(f"Replace kernel {kernel_name}'s ttgir with {insert_module_path}")            
+                if not mod.has_function(kernel_name):
+                    return mod
+            else:
+                insert_module_path = fn
+                print(f"Replace kernel's ttgir with {insert_module_path}")
+            ctx = mod.context
+            mod = ir.parse_mlir_module(insert_module_path, ctx)
+            mod.context = ctx
+
         return mod
 
     @staticmethod
