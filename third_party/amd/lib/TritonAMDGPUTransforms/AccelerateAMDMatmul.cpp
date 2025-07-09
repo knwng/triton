@@ -824,7 +824,7 @@ public:
     // Always use transposed mfma layout. This enables larger vectorization
     // for global store instructions.
     auto mfmaEnc = ttg::AMDMfmaEncodingAttr::get(
-        ctx, /*verison=*/mfmaVersion, warpsPerTile,
+        ctx, /*verison=*/mfmaVersion, warpsPerTile, tilesPerWarp,
         /*instrShape=*/mDim, nDim, /*isTransposed=*/true, ctaLayout,
         oldRetType.getElementType());
 
