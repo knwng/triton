@@ -288,7 +288,7 @@ class HIPBackend(BaseBackend):
             fn = os.environ['AMD_INSERT_TTGIR']
             if ':' in fn:
                 kernel_name, insert_module_path = fn.split(':')
-                print(f"Replace kernel {kernel_name}'s ttgir with {insert_module_path}")            
+                print(f"Replace kernel {kernel_name}'s ttgir with {insert_module_path}")
                 if not mod.has_function(kernel_name):
                     return mod
             else:
@@ -408,6 +408,23 @@ class HIPBackend(BaseBackend):
         # Disable inlining of print related functions,
         # because inlining of these function could slow down compilation significantly
         amd.disable_print_inline(llvm_mod)
+
+        import os
+        if "AMD_INSERT_LLVM_IR" in os.environ.keys():
+            if ':' in os.environ["AMD_INSERT_LLVM_IR"]:
+                kernel_name, insert_module_path = os.environ["AMD_INSERT_LLVM_IR"].split(':')
+                if kernel_name == fns[0].name:
+                    print(f"Replace kernel {kernel_name}'s llir with {insert_module_path}")
+                else:
+                    return str(llvm_mod)
+            else:
+                insert_module_path = os.environ["AMD_INSERT_LLVM_IR"]
+                print(f"Replace kernel's llir with {insert_module_path}")
+            if not os.path.exists(insert_module_path):
+                raise RuntimeError(f'cannot find llvm ir file to insert. Given: `{insert_module_path}`')
+            with open(insert_module_path, "r") as file:
+                return file.read()
+
         return str(llvm_mod)
 
     @staticmethod
@@ -435,6 +452,23 @@ class HIPBackend(BaseBackend):
         #     amdgcn = f.read()
         with open("out.amdgcn", "w") as f:
             f.write(amdgcn)
+
+        import os
+        if "AMD_INSERT_AMDGCN" in os.environ.keys():
+            if ':' in os.environ["AMD_INSERT_AMDGCN"]:
+                kernel_name, insert_module_path = os.environ["AMD_INSERT_AMDGCN"].split(':')
+                if kernel_name == metadata["name"]:
+                    print(f"Replace kernel {kernel_name}'s amdgcn with {insert_module_path}")
+                else:
+                    return amdgcn
+            else:
+                insert_module_path = os.environ["AMD_INSERT_AMDGCN"]
+                print(f"Replace kernel's amdgcn with {insert_module_path}")
+            if not os.path.exists(insert_module_path):
+                raise RuntimeError(f'cannot find amdgcn file to insert. Given: `{insert_module_path}`')
+            with open(insert_module_path, "r") as file:
+                return file.read()
+
         return amdgcn
 
     @staticmethod

@@ -1,4 +1,3 @@
-import os
 import torch
 import triton
 from triton_kernels.target_info import get_cdna_version
@@ -30,7 +29,8 @@ def compute_block_nk(m, n, block_m, grid_m, num_xcds, lhs_dtype, rhs_dtype, micr
     # TODO: block_k = 128 seems to work better for now.
     #       perhaps due to increased number of k loops to pipeline
     # if microscaling_ctx.weight_scale is not None:
-    use_large_block = os.environ.get('TRITON_USE_LARGE_BLOCK', '0') == '1'
-    if is_mxfp_weight and (get_cdna_version() != 4 or (not use_large_block)):
+    # use_large_block = os.environ.get('TRITON_USE_LARGE_BLOCK', '0') == '1'
+    # if is_mxfp_weight and (get_cdna_version() != 4 or (not use_large_block)):
+    if is_mxfp_weight and get_cdna_version() != 4:
         block_k = 128
     return block_n, block_k

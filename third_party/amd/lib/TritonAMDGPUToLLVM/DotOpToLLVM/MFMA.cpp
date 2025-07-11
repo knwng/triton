@@ -705,7 +705,8 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     auto tb = TritonLLVMOpBuilder(loc, rewriter);
     auto vecTy = vec_ty(dstElemTy, elemsPerVec);
 
-    int dividePoint = numVecInKBase * numRepB * numRepM * numRepN / 2;
+    // int dividePoint = numVecInKBase * numRepB * numRepM * numRepN / 2;
+    int dividePoint = numVecInKBase * numRepB * numRepM * numRepN;
     int currIter = 0;
     bool is2Step = false;
     int innerK = 0, outerK = 0, innerKBound = 1, outerKBound = 1;
@@ -820,6 +821,12 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
         }
       }
     }
+
+    // if (is2Step) {
+    //   rewriter.create<ROCDL::SchedBarrier>(loc, 0);
+    //   rewriter.create<ROCDL::SBarrierOp>(loc);
+    //   rewriter.create<ROCDL::SchedBarrier>(loc, 0);
+    // }
 
     // Originally, setprio (high) is set to the high-level dot op. After dot is
     // being lowered to the series of mfma operations, it should be moved next

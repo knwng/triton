@@ -617,6 +617,7 @@ def matmul_ogs(x, w, bias,
     #     print(f'{opt_flags=}')
     #     print(f'{flex.out_data.reinterpret(out0).shape}, {flex.lhs_data.reinterpret(x).shape}, {flex.rhs_data.reinterpret(w).shape}')
     # cnt += 1
+    # print(f'{opt_flags=}')
     (kernels._p_matmul_ogs if opt_flags.is_persistent else kernels._matmul_ogs)[(n_cta,)](
                    flex.out_data.reinterpret(memory["output"]),
                    flex.out_data.reinterpret(out0), *out0.stride(),
