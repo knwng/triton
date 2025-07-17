@@ -61,9 +61,9 @@ def make_default_opt_flags_amd(
     if constraints.get("block_m", None):
         block_m = constraints["block_m"]
     elif enforce_bitwise_invariance:
-        block_m = 256 if is_cdna4 else 128
+        block_m = 128
     elif tokens_per_expt >= 512 and n >= 2048:
-        block_m = 256 if is_cdna4 else 128
+        block_m = 128
     elif is_cdna4 and m >= 512:
         block_m = 128
     else:
@@ -74,7 +74,7 @@ def make_default_opt_flags_amd(
     else:
         grid_m = triton.cdiv(m, block_m)
     # group_m:
-    group_m = 4
+    group_m = 8
     # number of xcds
     num_xcds = 8
     xcd_swizzle = num_xcds

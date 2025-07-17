@@ -85,6 +85,8 @@ private:
                                                        Location loc);
   LogicalResult transformTwoClusterWithAsyncAndAll(OpBuilder &builder,
                                                    Location loc);
+  LogicalResult transformTwoClusterMemAndCompute(OpBuilder &builder,
+                                                 Location loc);
   void addAsymmetricSyncToLoop(OpBuilder &builder, Location loc);
   void updateOpInsertion(Operation *Op);
   void appendOp(Operation *Op);
@@ -667,6 +669,34 @@ LogicalResult Pingponger::transformTwoClusterWithAsyncAndAll(OpBuilder &builder,
   return success();
 }
 
+LogicalResult Pingponger::transformTwoClusterMemAndCompute(OpBuilder &builder,
+                                                           Location loc) {
+  LDBG("Enter transformTwoClusterMemAndCompute");
+  if (asyncCopyOps.size() == 0)
+    return failure();
+  builder.setInsertionPointAfter(asyncWaitOps[0]);
+  updateOpInsertion(asyncWaitOps[0]);
+
+  // mem cluster contains async_copies and tt.load if LDS bypassed.
+  for (auto cop : asyncCommitOps)
+    moveOpAndPredecessorsUpSameBlock(cop);
+  for (auto glop : gLoadOps)
+    moveOpAndPredecessorsUpSameBlock(glop);
+  for (auto llop : lLoadOps)
+    moveOpAndPredecessorsUpSameBlock(llop);
+
+  appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
+  appendOp(builder.create<ROCDL::SBarrierOp>(loc));
+  appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
+
+  // all other ops are placed in the second cluster
+  // set unit attr, so it can trigger the second step in the ttg to llvm
+  // lowering pass.
+  scaledDotOps[0]->setAttr("pingpong_2step", builder.getUnitAttr());
+
+  return success();
+}
+
 // This pingpong variant tries to construct one memory cluster and one
 // dot cluster. Instead of slice the tile, it is supposed to use half
 // sized tile_K and use num_stages=3 to prefetch and hide the buffer
@@ -773,6 +803,8 @@ void Pingponger::getDotPingponged() {
   MLIRContext *ctx = forOp.getContext();
   Location loc = forOp.getLoc();
 
+  // llvm::outs() << "[Begin forOp]\n" << forOp << "\n[End forOp]\n";
+
   forOp->walk([&](Operation *op) {
     llvm::TypeSwitch<Operation *>(op)
         .Case<tt::LoadOp>([&](auto gLoadOp) { gLoadOps.push_back(gLoadOp); })
@@ -794,8 +826,8 @@ void Pingponger::getDotPingponged() {
             [&](auto pingpongDot) { dotOps.push_back(pingpongDot); })
         .Case<tt::DotScaledOp>(
             [&](auto pingpongDot) { scaledDotOps.push_back(pingpongDot); })
-        .Case<ttg::AsyncCopyGlobalToLocalOp>(
-            [&](auto asyncOp) { asyncCopyOps.push_back(asyncOp); })
+        // .Case<ttg::AsyncCopyGlobalToLocalOp>(
+        //     [&](auto asyncOp) { asyncCopyOps.push_back(asyncOp); })
         .Case<ttg::AsyncCommitGroupOp>([&](auto asyncCommitGroupOp) {
           asyncCommitOps.push_back(asyncCommitGroupOp);
         })
@@ -831,18 +863,34 @@ void Pingponger::getDotPingponged() {
 
   if (scaledDotOps.size() == 1 && numWarps == 8 && numStages == 2 &&
       asyncCopyOps.size() > 0) {
+    LDBG("Go through dot_scaled path");
     auto scaledDotType = scaledDotOps[0].getType();
     auto scaledDotShape = scaledDotType.getShape();
     auto aType = scaledDotOps[0].getA().getType();
+    auto bType = scaledDotOps[0].getB().getType();
     auto aShape = aType.getShape();
+    auto bShape = bType.getShape();
     auto elemWidth = aType.getElementTypeBitWidth();
     int64_t tileSize = scaledDotShape[0] * scaledDotShape[1] * aShape[1];
+
+    // llvm::outs() << "tileSize: " << tileSize << "\n";
 
     // 256x256x256 (128xi8)
     if (tileSize == 8388608 && aShape[0] == 256 && aShape[1] == 128 &&
         elemWidth == 8) {
       kWidth = 16;
       if (transformTwoClusterWithAsyncAndAll(builder, scaledDotOps[0]->getLoc())
+              .failed()) {
+        LDBG(
+            "Encountered failure when trying to execute the two-step ping pong "
+            "cluster transformation");
+        return;
+      }
+    } else if (tileSize == 8388608 && aShape[0] == 128 && aShape[1] == 256 &&
+               elemWidth == 8) {
+      // 128x256x256 fp8xmxfp4
+      kWidth = 16;
+      if (transformTwoClusterMemAndCompute(builder, scaledDotOps[0]->getLoc())
               .failed()) {
         LDBG(
             "Encountered failure when trying to execute the two-step ping pong "

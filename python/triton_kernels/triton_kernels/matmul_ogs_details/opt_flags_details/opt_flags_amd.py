@@ -20,8 +20,8 @@ def compute_block_nk(n, block_m, grid_m, num_xcds, lhs_dtype, rhs_dtype, precisi
     else:
         block_n = 128
 
-    if get_cdna_version() == 4 and block_m == 128:
-        block_n = 512
+    # if get_cdna_version() == 4 and block_m == 128:
+    #     block_n = 512
 
     # block_k needs to match the cacheline size (128B)
     block_k = int(128 // min(lhs_width, rhs_width))
