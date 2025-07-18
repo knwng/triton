@@ -235,11 +235,6 @@ def _matmul_ogs(
         offs_n_scale = tl.max_contiguous(tl.multiple_of(offs_n_scale, SCALE_BLOCK_N), SCALE_BLOCK_N)
         # K dimension must be the last dimension for the scales
         offs_k_scale = PACKED_MX_BLOCK * pid_k + tl.arange(0, PACKED_MX_BLOCK)
-        # if SWIZZLE_MX_SCALE == "GFX950_SCALE":
-        #     tl.static_assert(SPLIT_K == 1)
-        #     offs_n_scale = (pid_n * (BLOCK_N // 32) + tl.arange(0, (BLOCK_N // 32))) % N
-        #     SPLITK_BLOCK_SIZE = 1
-        #     offs_k_scale = (pid_k * (SPLITK_BLOCK_SIZE // MX_PACK_DIVISOR) * 32) + tl.arange(0, BLOCK_K // MX_PACK_DIVISOR * 32)
         MxScalePtrs = MxScale + offs_k_scale.to(index_type)[None, :] * stride_scale_k + offs_n_scale.to(index_type)[:, None] * stride_mx_n
     else:
         MxScalePtrs = None

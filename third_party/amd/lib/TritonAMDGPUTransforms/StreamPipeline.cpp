@@ -731,6 +731,7 @@ struct PipelinePass : impl::TritonAMDGPUStreamPipelineBase<PipelinePass> {
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
+    // llvm::outs() << "[Begin StreamPipeline Module]\n" << moduleOp << "\n[End StreamPipeline Module]\n";
     // check numStages
     if (globalPrefetch < 0 || globalPrefetch >= numStages) {
       moduleOp.emitError("global prefetch control must be in [0, ")

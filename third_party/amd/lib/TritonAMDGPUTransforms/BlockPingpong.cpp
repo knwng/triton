@@ -875,6 +875,10 @@ void Pingponger::getDotPingponged() {
 
     // llvm::outs() << "tileSize: " << tileSize << "\n";
 
+    bool isfp8mxfp4_128x256x256 = (tileSize == 8388608 && aShape[0] == 128 && aShape[1] == 256 && elemWidth == 8);
+    bool isfp8fp8_128x256x128 = (tileSize == 4194304 && aShape[0] == 128 && aShape[1] == 128 && elemWidth == 8);
+    bool isfp8fp8_128x512x128 = (tileSize == 8388608 && aShape[0] == 128 && aShape[1] == 128 && elemWidth == 8);
+
     // 256x256x256 (128xi8)
     if (tileSize == 8388608 && aShape[0] == 256 && aShape[1] == 128 &&
         elemWidth == 8) {
@@ -886,9 +890,8 @@ void Pingponger::getDotPingponged() {
             "cluster transformation");
         return;
       }
-    } else if (tileSize == 8388608 && aShape[0] == 128 && aShape[1] == 256 &&
-               elemWidth == 8) {
-      // 128x256x256 fp8xmxfp4
+    } else if (isfp8mxfp4_128x256x256 || isfp8fp8_128x256x128 || isfp8fp8_128x512x128) {
+      // 128x256x256 fp8xmxfp4 || 128x256x128 fp8xfp8
       kWidth = 16;
       if (transformTwoClusterMemAndCompute(builder, scaledDotOps[0]->getLoc())
               .failed()) {
