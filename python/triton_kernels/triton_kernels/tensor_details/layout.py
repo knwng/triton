@@ -6,10 +6,6 @@ from .layout_details.strided import StridedLayout
 from .layout_details.gfx950 import GFX950MXScaleLayout
 
 __all__ = [
-    "Layout",
-    "BlackwellMXScaleLayout",
-    "HopperMXScaleLayout",
-    "HopperMXValueLayout",
-    "StridedLayout",
+    "Layout", "BlackwellMXScaleLayout", "HopperMXScaleLayout", "HopperMXValueLayout", "StridedLayout",
     "GFX950MXScaleLayout"
 ]
