@@ -3,6 +3,7 @@ from .layout_details.blackwell_scale import BlackwellMXScaleLayout
 from .layout_details.hopper_scale import HopperMXScaleLayout
 from .layout_details.hopper_value import HopperMXValueLayout
 from .layout_details.strided import StridedLayout
+from .layout_details.gfx950 import GFX950MXScaleLayout
 
 __all__ = [
     "Layout",
@@ -10,4 +11,5 @@ __all__ = [
     "HopperMXScaleLayout",
     "HopperMXValueLayout",
     "StridedLayout",
+    "GFX950MXScaleLayout"
 ]

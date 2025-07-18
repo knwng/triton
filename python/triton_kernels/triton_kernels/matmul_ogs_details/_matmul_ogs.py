@@ -219,6 +219,14 @@ def _matmul_ogs(
             PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K * 32
             SCALE_BLOCK_N: tl.constexpr = BLOCK_N // 32
             stride_scale_k = stride_mx_k
+        elif SWIZZLE_MX_SCALE == "GFX950_SCALE":
+            tl.static_assert(SPLIT_K == 1)
+            tl.static_assert(stride_mx_k is not None)
+            tl.static_assert(stride_mx_n is not None)
+            PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K * 32
+            SCALE_BLOCK_N: tl.constexpr = BLOCK_N // 32
+            # stride_scale_k = stride_mx_k
+            stride_scale_k = 1
         else:
             PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K
             SCALE_BLOCK_N: tl.constexpr = BLOCK_N
@@ -227,6 +235,11 @@ def _matmul_ogs(
         offs_n_scale = tl.max_contiguous(tl.multiple_of(offs_n_scale, SCALE_BLOCK_N), SCALE_BLOCK_N)
         # K dimension must be the last dimension for the scales
         offs_k_scale = PACKED_MX_BLOCK * pid_k + tl.arange(0, PACKED_MX_BLOCK)
+        # if SWIZZLE_MX_SCALE == "GFX950_SCALE":
+        #     tl.static_assert(SPLIT_K == 1)
+        #     offs_n_scale = (pid_n * (BLOCK_N // 32) + tl.arange(0, (BLOCK_N // 32))) % N
+        #     SPLITK_BLOCK_SIZE = 1
+        #     offs_k_scale = (pid_k * (SPLITK_BLOCK_SIZE // MX_PACK_DIVISOR) * 32) + tl.arange(0, BLOCK_K // MX_PACK_DIVISOR * 32)
         MxScalePtrs = MxScale + offs_k_scale.to(index_type)[None, :] * stride_scale_k + offs_n_scale.to(index_type)[:, None] * stride_mx_n
     else:
         MxScalePtrs = None
@@ -275,6 +288,8 @@ def _matmul_ogs(
                 # Handshake with the swizzling code
                 tl.static_assert(tl.extra.cuda.num_warps() == 8, "Only 8 warps are supported for Hopper swizzling. Got %d" % tl.extra.cuda.num_warps())
                 w_scales = unswizzle_mxfp4_scale_hopper(tl.load(MxScalePtrs), num_warps=8)
+            elif SWIZZLE_MX_SCALE == "GFX950_SCALE":
+                w_scales = tl.reshape(tl.load(MxScalePtrs), (BLOCK_N, MX_SCALE_BLOCK_K))
             else:
                 w_scales = tl.load(MxScalePtrs, mask=mask_k_scale[None, :], other=0.0)
 

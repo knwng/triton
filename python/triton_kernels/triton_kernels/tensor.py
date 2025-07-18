@@ -4,7 +4,7 @@ from .reduction_details.reduce_bitmatrix import clear_sums, sum_bitmatrix_rows
 from dataclasses import dataclass, fields
 from triton.tools.tensor_descriptor import TensorDescriptor
 from .tensor_details.layout import Layout, StridedLayout
-from .target_info import cuda_capability_geq
+from .target_info import cuda_capability_geq, is_hip
 
 
 @dataclass
@@ -24,6 +24,8 @@ class Storage:
 
     def is_tma_compliant(self):
         # TMAs didn't exist until Hopper
+        if is_hip():
+            return False
         if not cuda_capability_geq(9, 0):
             return False
         # TMAs only exist for 2D, 3D, 5D inputs
@@ -190,7 +192,10 @@ def convert_layout(tensor: Tensor, layout_cls: Type[Layout]):
     assert isinstance(tensor, Tensor)
     old_storage = tensor.storage
     old_data = old_storage.layout.unswizzle_data(old_storage.data)
+    # print(f'{old_data.shape=}, {old_data.dtype=}')
     new_layout = layout_cls(old_data.shape)
     new_data = new_layout.swizzle_data(old_data)
+    # print(f'{new_data.shape=}, {new_data.dtype=}')
     attrs = {k.name: getattr(tensor, k.name) for k in fields(tensor) if k.name != "storage"}
+    # print(f'{attrs=}')
     return Tensor(Storage(new_data, new_layout), **attrs)

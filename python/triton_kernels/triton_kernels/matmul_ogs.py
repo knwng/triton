@@ -479,7 +479,7 @@ def matmul_ogs(x, w, bias,
     # create tma descriptor for w_scale
     w_scale_tensor_or_tma = w_scale
     w_scale_has_tma = opt_flags.is_persistent and w_scale is not None
-    w_scale_tensor_or_tma =  w_scale.storage.make_tma([opt_flags.block_n, opt_flags.block_k]) if w_scale_has_tma else w_scale
+    w_scale_tensor_or_tma = w_scale.storage.make_tma([opt_flags.block_n, opt_flags.block_k]) if w_scale_has_tma else w_scale
     # canonicalize strides
     x_strides = [0]*(3 - x_storage.data.ndim) + list(x_storage.data.stride())
     w_scale_strides = w_scale.stride() if has_mx and not w_scale_has_tma else (None, None, None)
@@ -487,6 +487,8 @@ def matmul_ogs(x, w, bias,
         w_scale_strides = (0, ) + w_scale_strides
     # launch kernel
     kernels = get_kernels(epilogue.specs, fused_activation.specs)
+    # if w_scale_tensor_or_tma is not None:
+    #     print(f'{w_scale_tensor_or_tma.storage.data.shape=}, {w_scale_tensor_or_tma.storage.data.dtype=}, {w_scale_strides=}')
     (kernels._p_matmul_ogs if opt_flags.is_persistent else kernels._matmul_ogs)[(grid,)](
                    flex.out_data.reinterpret(memory["output"]),
                    flex.out_data.reinterpret(out0), *out0.stride(), *out0_flex,

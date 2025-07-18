@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from copy import deepcopy
 import matplotlib.pyplot as plt
@@ -12,7 +13,7 @@ from triton_kernels.numerics import InFlexData
 from triton_kernels.routing import routing
 from triton_kernels.target_info import is_hip, get_cdna_version, is_cuda
 from triton_kernels.tensor import convert_layout
-from triton_kernels.tensor_details.layout import StridedLayout, BlackwellMXScaleLayout, HopperMXScaleLayout, HopperMXValueLayout
+from triton_kernels.tensor_details.layout import StridedLayout, BlackwellMXScaleLayout, HopperMXScaleLayout, HopperMXValueLayout, GFX950MXScaleLayout
 from triton_kernels.tensor import wrap_torch_tensor, FP4
 from dataclasses import dataclass
 
@@ -110,6 +111,10 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
                 scale_layout = HopperMXScaleLayout
             if torch.cuda.get_device_capability()[0] == 10:
                 scale_layout = BlackwellMXScaleLayout
+        else:
+            if os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1":
+                scale_layout = GFX950MXScaleLayout
+                # scale_layout = StridedLayout
         opt1 = {"value_layout": value_layout, "scale_layout": scale_layout}
         opt2 = deepcopy(opt1)
     wg, wg_flex, wg_scale = quantize(wg, "bf16", dev, **optg)
@@ -119,6 +124,10 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
     act = FusedActivation(FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")), (1.0, 1.0), 2)
     pc1 = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w1_flex), weight_scale=w1_scale)
     pc2 = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex), weight_scale=w2_scale)
+    # print(f'{w1_scale.shape=}, {w1_scale.dtype=}')
+    # print(f'{w1.shape=}, {w1.dtype=}')
+    # print(f'{w2_scale.shape=}, {w2_scale.dtype=}')
+    # print(f'{w2.shape=}, {w2.dtype=}')
 
     # -- benchmark --
     fpath = Path(f"logs/{name}/{x_dtype}-{w_dtype}-TP{TP}-EP{EP}/profiles/batch-{batch}.hatchet")
@@ -132,16 +141,22 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
     xg = x.to(wg.dtype if n_expts_tot > 1 else x_dtype)
     x = x.to(x_dtype)
     # run layer
+    CACHE_FN = f"moe_cache_pingpong_{w_dtype}_{batch}.pt"
+    cache = []
+    cache = torch.load(CACHE_FN, weights_only=False)
     proton.start(str(fpath.with_suffix('')), hook="triton")
     for i in range(100):
-        if n_expts_tot > 1:
-            logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
-            rdata, gather_indx, scatter_indx = routing(logits, n_expts_act, simulated_ep=EP)
-        else:
-            rdata, gather_indx, scatter_indx = None, None, None
+        # if n_expts_tot > 1:
+        #     logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
+        #     rdata, gather_indx, scatter_indx = routing(logits, n_expts_act, simulated_ep=EP)
+        # else:
+        #     rdata, gather_indx, scatter_indx = None, None, None
+        # cache = (rdata, gather_indx, scatter_indx, x)
+        rdata, gather_indx, scatter_indx, x = cache
         x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
-        x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2)
+        # x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2)
     proton.finalize()
+    # torch.save(cache, CACHE_FN)
 
     # -- analyze --
     gf, _, _, info = viewer.read(fpath)
@@ -173,43 +188,43 @@ def roofline_mlp(batch_ranges, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_
             print(f"Batch: {batch}; Util: {perfs[-1].util}; TFLOPS: {perfs[-1].tflops}; TBPS: {perfs[-1].tbps}")
     print("===============================================================")
     # machine limits
-    max_tbps = perfs[0].max_tbps
-    max_tflops = perfs[0].max_tflops
-    fig, ax = plt.subplots(figsize=(7, 5), dpi=120)
-    ax.set_xlabel("batch size (toks/expt)")
-    ax.set_ylabel("performance  [TFLOP/s]")
-    ax.set_title(f"{bench_case} roofline")
-    # add a tiny margin so points are not flush with the frame
-    xs = [batch * n_expts_act / n_expts_tot for batch in batches]
-    perf = [p.tflops for p in perfs]
-    xmin, xmax = min(xs), max(xs)
-    dx = 0.05 * (xmax - xmin) if xmax > xmin else 1.0
-    ax.set_xlim(xmin - dx, xmax + dx)
-    ax.set_ylim(100, max_tflops + 500)
-    # plot roofline
-    opints = [p.opint for p in perfs]
-    knee = bisect_left(opints, max_tflops / max_tbps) - 1
-    x_bw, x_comp = xs[:knee], xs[knee:]
-    x_bw = [x_bw[0], x_comp[0]]
-    y_bw = [opints[0] * max_tbps, max_tflops]
-    y_comp = [max_tflops] * len(x_comp)
-    ax.plot(x_bw, y_bw, "--", label=f"BW-bound  ({max_tbps:.1f} TB/s)")
-    ax.plot(x_comp, y_comp, "--", label=f"Compute-bound  ({max_tflops:.0f} TFLOP/s)")
-    # plot data
-    ax.scatter(xs, perf, marker="+")
-    ax.legend(frameon=False, loc="lower right")
-    ax.grid(True, which="both", ls=":", lw=0.5)
-    fig.tight_layout()
-    fpath = Path(f"logs/{name}/{x_dtype}-{w_dtype}-TP{TP}-EP{EP}/roofline.png")
-    plt.savefig(fpath)
+    # max_tbps = perfs[0].max_tbps
+    # max_tflops = perfs[0].max_tflops
+    # fig, ax = plt.subplots(figsize=(7, 5), dpi=120)
+    # ax.set_xlabel("batch size (toks/expt)")
+    # ax.set_ylabel("performance  [TFLOP/s]")
+    # ax.set_title(f"{bench_case} roofline")
+    # # add a tiny margin so points are not flush with the frame
+    # xs = [batch * n_expts_act / n_expts_tot for batch in batches]
+    # perf = [p.tflops for p in perfs]
+    # xmin, xmax = min(xs), max(xs)
+    # dx = 0.05 * (xmax - xmin) if xmax > xmin else 1.0
+    # ax.set_xlim(xmin - dx, xmax + dx)
+    # ax.set_ylim(100, max_tflops + 500)
+    # # plot roofline
+    # opints = [p.opint for p in perfs]
+    # knee = bisect_left(opints, max_tflops / max_tbps) - 1
+    # x_bw, x_comp = xs[:knee], xs[knee:]
+    # x_bw = [x_bw[0], x_comp[0]]
+    # y_bw = [opints[0] * max_tbps, max_tflops]
+    # y_comp = [max_tflops] * len(x_comp)
+    # ax.plot(x_bw, y_bw, "--", label=f"BW-bound  ({max_tbps:.1f} TB/s)")
+    # ax.plot(x_comp, y_comp, "--", label=f"Compute-bound  ({max_tflops:.0f} TFLOP/s)")
+    # # plot data
+    # ax.scatter(xs, perf, marker="+")
+    # ax.legend(frameon=False, loc="lower right")
+    # ax.grid(True, which="both", ls=":", lw=0.5)
+    # fig.tight_layout()
+    # fpath = Path(f"logs/{name}/{x_dtype}-{w_dtype}-TP{TP}-EP{EP}/roofline.png")
+    # plt.savefig(fpath)
 
 
 if __name__ == "__main__":
     has_native_mx4 = torch.cuda.get_device_capability(0)[0] >= 10 or get_cdna_version() == 4
     batch_ranges_dense = [(1024, 32768, 1024)]
     # batch_ranges_moe = [(128, 512, 32), (512, 32000, 128)]
-    batch_ranges_moe = [(1024, 32768, 1024)]
-    # batch_ranges_moe = [(31744, 31745, 1024)]
+    # batch_ranges_moe = [(1024, 32768, 1024)]
+    batch_ranges_moe = [(31744, 31745, 1024)]
     dense_dtypes = ["fp8", "fp8"]
     quantized_dtypes = ["fp8", "mx4"] if has_native_mx4 else ["bf16", "mx4"]
     # roofline_mlp(batch_ranges_dense, 8192, 8192, 1, 1, *dense_dtypes, TP=1, EP=1, name="dense")

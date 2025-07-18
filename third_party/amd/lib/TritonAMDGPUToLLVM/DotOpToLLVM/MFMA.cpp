@@ -724,83 +724,105 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     auto elemsPerVec = mDim * nDim * subBlocks / warpSize;
     int numVecInKBase = numRepK * aKWidth / aKBase;
 
+    // int halfPoint = numVecInKBase * numRepB * numRepM * numRepN / 2;
+    int halfPoint = numVecInKBase * numRepB * numRepM * numRepN;
+    int currIter = 0;
+    bool is2Step = false;
+    int innerK = 0, outerK = 0, innerKBound = 1, outerKBound = 1;
+    // In order to split mfma by K, change the outermost loop iterates
+    // over the K in emitting the mfma operations.
+    if (auto pingpongUnitAttr = op->getAttr("pingpong_2step")) {
+      is2Step = true;
+      outerKBound = numVecInKBase;
+    } else
+      innerKBound = numVecInKBase;
+
     Value firstMfma;
     auto tb = TritonLLVMOpBuilder(loc, rewriter);
     auto vecTy = vec_ty(dstElemTy, elemsPerVec);
-    for (int b = 0; b < numRepB; ++b) {
-      for (int m = 0; m < numRepM; ++m) {
-        for (int n = 0; n < numRepN; ++n) {
-          Value acc = tb.undef(vecTy);
-          for (unsigned v = 0; v < elemsPerVec; ++v) {
-            acc = tb.insert_element(
-                vecTy, acc,
-                fc[b * numRepM * numRepN * elemsPerVec +
-                   m * numRepN * elemsPerVec + n * elemsPerVec + v],
-                tb.i32_val(v));
-          }
-          acc = zeroAuxiliarBlocks(subBlocks, acc);
-          for (int k = 0; k < numVecInKBase; k++) {
-            if (existBothScales) {
-              int mScale = m;
-              int nScale = n;
-              int kmScale = k;
-              int knScale = k;
-
-              // Selection indices
-              int opSelA = 0, opSelB = 0;
-              int nonKPackedVals = 4 / numVecInKBase;
-              int kMod = k % numVecInKBase;
-
-              // Adjust the scale indices based on the packing pattern and
-              // compute opSel indices. Four 8-bit scales are packed into a
-              // single 32-bit value. Scales are always packed along the k
-              // dimension first. If the number of scales along k is fewer
-              // than four, packing continues along the nonK dimension.
-              if (preshuffleScaleA) {
-                mScale /= nonKPackedVals;
-                kmScale /= numVecInKBase;
-                opSelA = (m % nonKPackedVals) * numVecInKBase + kMod;
-              }
-              if (preshuffleScaleB) {
-                nScale /= nonKPackedVals;
-                knScale /= numVecInKBase;
-                opSelB = (n % nonKPackedVals) * numVecInKBase + kMod;
-              }
-
-              if (mfmaLayout.getIsTransposed()) {
-                acc = generateScaledMFMAOp(
-                    intrinsicName, operandB[{b, n, k}], operandA[{b, m, k}],
-                    acc, operandBScale[{b, nScale, knScale}],
-                    operandAScale[{b, mScale, kmScale}],
-                    maybeMfmaIntrinsic->bElementType,
-                    maybeMfmaIntrinsic->aElementType, opSelB, opSelA);
-              } else {
-                acc = generateScaledMFMAOp(
-                    intrinsicName, operandA[{b, m, k}], operandB[{b, n, k}],
-                    acc, operandAScale[{b, mScale, kmScale}],
-                    operandBScale[{b, nScale, knScale}],
-                    maybeMfmaIntrinsic->aElementType,
-                    maybeMfmaIntrinsic->bElementType, opSelA, opSelB);
-              }
-            } else {
-              if (mfmaLayout.getIsTransposed()) {
-                acc = generateScaledMFMAOp(intrinsicName, operandB[{b, n, k}],
-                                           operandA[{b, m, k}], acc,
-                                           maybeMfmaIntrinsic->bElementType,
-                                           maybeMfmaIntrinsic->aElementType);
-              } else {
-                acc = generateScaledMFMAOp(intrinsicName, operandA[{b, m, k}],
-                                           operandB[{b, n, k}], acc,
-                                           maybeMfmaIntrinsic->aElementType,
-                                           maybeMfmaIntrinsic->bElementType);
-              }
+    for (outerK = 0; outerK < outerKBound; outerK++) {
+      for (int b = 0; b < numRepB; ++b) {
+        for (int m = 0; m < numRepM; ++m) {
+          for (int n = 0; n < numRepN; ++n) {
+            // Insert pingpong cluster barrier when needed.
+            // if (is2Step && currIter++ == halfPoint) {
+            //   rewriter.create<ROCDL::SchedBarrier>(loc, 0);
+            //   rewriter.create<ROCDL::SBarrierOp>(loc);
+            //   rewriter.create<ROCDL::SchedBarrier>(loc, 0);
+            // }
+            Value acc = tb.undef(vecTy);
+            for (unsigned v = 0; v < elemsPerVec; ++v) {
+              acc = tb.insert_element(
+                  vecTy, acc,
+                  fc[b * numRepM * numRepN * elemsPerVec +
+                     m * numRepN * elemsPerVec + n * elemsPerVec + v],
+                  tb.i32_val(v));
             }
-            if (!firstMfma)
-              firstMfma = acc;
+            acc = zeroAuxiliarBlocks(subBlocks, acc);
+            for (innerK = 0; innerK < innerKBound; innerK++) {
+              int k = is2Step ? outerK : innerK;
+              if (existBothScales) {
+                int mScale = m;
+                int nScale = n;
+                int kmScale = k;
+                int knScale = k;
+
+                // Selection indices
+                int opSelA = 0, opSelB = 0;
+                int nonKPackedVals = 4 / numVecInKBase;
+                int kMod = k % numVecInKBase;
+
+                // Adjust the scale indices based on the packing pattern and
+                // compute opSel indices. Four 8-bit scales are packed into a
+                // single 32-bit value. Scales are always packed along the k
+                // dimension first. If the number of scales along k is fewer
+                // than four, packing continues along the nonK dimension.
+                if (preshuffleScaleA) {
+                  mScale /= nonKPackedVals;
+                  kmScale /= numVecInKBase;
+                  opSelA = (m % nonKPackedVals) * numVecInKBase + kMod;
+                }
+                if (preshuffleScaleB) {
+                  nScale /= nonKPackedVals;
+                  knScale /= numVecInKBase;
+                  opSelB = (n % nonKPackedVals) * numVecInKBase + kMod;
+                }
+
+                if (mfmaLayout.getIsTransposed()) {
+                  acc = generateScaledMFMAOp(
+                      intrinsicName, operandB[{b, n, k}], operandA[{b, m, k}],
+                      acc, operandBScale[{b, nScale, knScale}],
+                      operandAScale[{b, mScale, kmScale}],
+                      maybeMfmaIntrinsic->bElementType,
+                      maybeMfmaIntrinsic->aElementType, opSelB, opSelA);
+                } else {
+                  acc = generateScaledMFMAOp(
+                      intrinsicName, operandA[{b, m, k}], operandB[{b, n, k}],
+                      acc, operandAScale[{b, mScale, kmScale}],
+                      operandBScale[{b, nScale, knScale}],
+                      maybeMfmaIntrinsic->aElementType,
+                      maybeMfmaIntrinsic->bElementType, opSelA, opSelB);
+                }
+              } else {
+                if (mfmaLayout.getIsTransposed()) {
+                  acc = generateScaledMFMAOp(intrinsicName, operandB[{b, n, k}],
+                                             operandA[{b, m, k}], acc,
+                                             maybeMfmaIntrinsic->bElementType,
+                                             maybeMfmaIntrinsic->aElementType);
+                } else {
+                  acc = generateScaledMFMAOp(intrinsicName, operandA[{b, m, k}],
+                                             operandB[{b, n, k}], acc,
+                                             maybeMfmaIntrinsic->aElementType,
+                                             maybeMfmaIntrinsic->bElementType);
+                }
+              }
+              if (!firstMfma)
+                firstMfma = acc;
+            }
+            acc = reduceSubBlocks(subBlocks, acc);
+            adjustAccForSmallKDim(fc, acc, dstElemTy, b, m, n, numRepM, numRepN,
+                                  kDimInstrSize, kDimOperandSize, elemsPerVec);
           }
-          acc = reduceSubBlocks(subBlocks, acc);
-          adjustAccForSmallKDim(fc, acc, dstElemTy, b, m, n, numRepM, numRepN,
-                                kDimInstrSize, kDimOperandSize, elemsPerVec);
         }
       }
     }
