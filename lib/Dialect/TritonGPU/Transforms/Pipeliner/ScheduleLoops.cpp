@@ -135,6 +135,36 @@ void scheduleRemainingToLastStage(scf::ForOp forOp, CoarseSchedule &schedule,
   }
 }
 
+// Compute the longest path to the yield for each operation reachable
+// from any latency operation.
+int computeDistance(scf::ForOp forOp,
+                    const DenseMap<Operation *, int> &opLatency,
+                    DenseMap<Operation *, int> &distance, Operation *op) {
+  auto it = distance.find(op);
+  if (it != distance.end())
+    return it->second;
+  auto terminator = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  // Compute max distance among all users that are inside the loop body
+  int maxDist = -1;
+  for (Operation *user : op->getUsers()) {
+    // Only consider users inside the same block and not the terminator
+    Operation *inBlockUser = forOp.getBody()->findAncestorOpInBlock(*user);
+    if (!inBlockUser || inBlockUser == terminator)
+      continue;
+    int distUser = computeDistance(forOp, opLatency, distance, inBlockUser);
+    if (distUser > maxDist)
+      maxDist = distUser;
+  }
+  int lat = 0;
+  if (opLatency.count(op))
+    lat = opLatency.lookup(op);
+  // If an op has no users (maxDist == -1) but has latency, we include its
+  // latency otherwise it contributes 0 to the distance.
+  int d = lat + (maxDist < 0 ? 0 : maxDist);
+  distance[op] = d;
+  return d;
+}
+
 namespace {
 bool hasLatenciesAssigned(scf::ForOp forOp,
                           const DenseMap<Operation *, int> &opLatency) {
@@ -149,7 +179,7 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
                               const DenseMap<Operation *, int> &opLatency) {
   llvm::MapVector<Operation *, int> opToStage;
   // Find terminator for later reference
-  auto terminator = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  // auto terminator = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
   // Determine all operations that have a non-zero latency
   SmallVector<Operation *> latOps;
   for (auto &op : forOp.getBody()->without_terminator()) {
@@ -161,38 +191,12 @@ CoarseSchedule scheduleKeyOps(scf::ForOp forOp,
     return CoarseSchedule(0);
 
   DominanceInfo domInfo(forOp);
-  // Compute the longest path to the yield for each operation reachable
-  // from any latency operation.
-  DenseMap<Operation *, int> distance;
-  std::function<int(Operation *)> computeDistance = [&](Operation *op) -> int {
-    auto it = distance.find(op);
-    if (it != distance.end())
-      return it->second;
-    // Compute max distance among all users that are inside the loop body
-    int maxDist = -1;
-    for (Operation *user : op->getUsers()) {
-      // Only consider users inside the same block and not the terminator
-      Operation *inBlockUser = forOp.getBody()->findAncestorOpInBlock(*user);
-      if (!inBlockUser || inBlockUser == terminator)
-        continue;
-      int distUser = computeDistance(inBlockUser);
-      if (distUser > maxDist)
-        maxDist = distUser;
-    }
-    int lat = 0;
-    if (opLatency.count(op))
-      lat = opLatency.lookup(op);
-    // If an op has no users (maxDist == -1) but has latency, we include its
-    // latency otherwise it contributes 0 to the distance.
-    int d = lat + (maxDist < 0 ? 0 : maxDist);
-    distance[op] = d;
-    return d;
-  };
 
   // Compute distances for all latency-starting ops
+  DenseMap<Operation *, int> distance;
   int maxDistance = 0;
   for (Operation *latOp : latOps) {
-    int d = computeDistance(latOp);
+    int d = computeDistance(forOp, opLatency, distance, latOp);
     if (d > maxDistance)
       maxDistance = d;
   }

@@ -665,8 +665,10 @@ buildSchedule(scf::ForOp &forOp, int numStages, const LoadToInfoMap &loadToInfo,
   triton::gpu::scheduleRemainingToLastStage(forOp, schedule, computeCluster);
   dumpSchedule("Final coarse schedule:");
 
-  std::vector<std::pair<Operation *, unsigned>> coarseSchedule =
-      schedule.createFinalSchedule(forOp);
+  // std::vector<std::pair<Operation *, unsigned>> coarseSchedule =
+  //     schedule.createFinalSchedule(forOp);
+
+  schedule.serialize(forOp);
 
   return schedule;
 }

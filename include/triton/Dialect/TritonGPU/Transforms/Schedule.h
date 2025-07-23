@@ -204,6 +204,9 @@ void scheduleDistanceOneDependencies(scf::ForOp forOp,
                                      CoarseSchedule &schedule);
 void scheduleRemainingToLastStage(scf::ForOp forOp, CoarseSchedule &schedule,
                                   CoarseSchedule::Cluster afterPrologue);
+int computeDistance(scf::ForOp forOp,
+                    const DenseMap<Operation *, int> &opLatency,
+                    DenseMap<Operation *, int> &distance, Operation *op);
 } // namespace gpu
 
 } // namespace triton

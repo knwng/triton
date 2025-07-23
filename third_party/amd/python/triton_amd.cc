@@ -84,6 +84,9 @@ void init_triton_amd_passes_ttgpuir(py::module &&m) {
   ADD_PASS_OPTION_WRAPPER_5("add_stream_pipeline",
                             mlir::createTritonAMDGPUStreamPipeline, int, int,
                             int, bool, bool);
+  // ADD_PASS_OPTION_WRAPPER_5("add_schedule_loops",
+  //                           mlir::createTritonAMDGPUScheduleLoops, int, int,
+  //                           int, bool, bool);
   ADD_PASS_OPTION_WRAPPER_1("add_coalesce_async_copy",
                             mlir::createTritonAMDGPUCoalesceAsyncCopy,
                             std::string);

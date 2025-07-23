@@ -200,7 +200,7 @@ class HIPBackend(BaseBackend):
                                            options.num_ctas)
         pm.run(mod)
         pm = ir.pass_manager(mod.context)
-        pm.enable_debug()
+        dump_enabled = pm.enable_debug()
         passes.ttgpuir.add_coalesce(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
@@ -220,6 +220,9 @@ class HIPBackend(BaseBackend):
         use_async_copy = knobs.amd.use_async_copy
         use_block_pingpong = is_pingpong_schedule_enabled(options.arch)
 
+        passes.ttgpuir.add_assign_latencies(pm, options.num_stages)
+        # amd.passes.ttgpuir.add_schedule_loops(pm)
+        # passes.ttgpuir.add_pipeline(pm, options.num_stages, dump_enabled)
         amd.passes.ttgpuir.add_stream_pipeline(pm, options.num_stages, global_prefetch, local_prefetch, use_async_copy,
                                                use_block_pingpong)
         if use_async_copy:
