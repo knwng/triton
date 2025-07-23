@@ -85,6 +85,8 @@ private:
                                                        Location loc);
   LogicalResult transformTwoClusterWithAsyncAndAll(OpBuilder &builder,
                                                    Location loc);
+  LogicalResult transformTwoClusterMemAndCompute(OpBuilder &builder,
+                                                 Location loc);
   void addAsymmetricSyncToLoop(OpBuilder &builder, Location loc);
   void updateOpInsertion(Operation *Op);
   void appendOp(Operation *Op);
@@ -667,6 +669,32 @@ LogicalResult Pingponger::transformTwoClusterWithAsyncAndAll(OpBuilder &builder,
   return success();
 }
 
+// This transform schedules instructions into two clusters, the first cluster
+// with all memory access ops(async copy, global load, local load) and the
+// second cluster with mfma ops. We don't need 2-step pingpong in this case.
+LogicalResult Pingponger::transformTwoClusterMemAndCompute(OpBuilder &builder,
+                                                           Location loc) {
+  LDBG("Enter transformTwoClusterMemAndCompute");
+  if (asyncCopyOps.size() == 0)
+    return failure();
+  builder.setInsertionPointAfter(asyncWaitOps[0]);
+  updateOpInsertion(asyncWaitOps[0]);
+
+  // mem cluster contains async_copies and tt.load if LDS bypassed.
+  for (auto cop : asyncCommitOps)
+    moveOpAndPredecessorsUpSameBlock(cop);
+  for (auto glop : gLoadOps)
+    moveOpAndPredecessorsUpSameBlock(glop);
+  for (auto llop : lLoadOps)
+    moveOpAndPredecessorsUpSameBlock(llop);
+
+  appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
+  appendOp(builder.create<ROCDL::SBarrierOp>(loc));
+  appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
+
+  return success();
+}
+
 // This pingpong variant tries to construct one memory cluster and one
 // dot cluster. Instead of slice the tile, it is supposed to use half
 // sized tile_K and use num_stages=3 to prefetch and hide the buffer
@@ -794,8 +822,6 @@ void Pingponger::getDotPingponged() {
             [&](auto pingpongDot) { dotOps.push_back(pingpongDot); })
         .Case<tt::DotScaledOp>(
             [&](auto pingpongDot) { scaledDotOps.push_back(pingpongDot); })
-        .Case<ttg::AsyncCopyGlobalToLocalOp>(
-            [&](auto asyncOp) { asyncCopyOps.push_back(asyncOp); })
         .Case<ttg::AsyncCommitGroupOp>([&](auto asyncCommitGroupOp) {
           asyncCommitOps.push_back(asyncCommitGroupOp);
         })
@@ -847,6 +873,17 @@ void Pingponger::getDotPingponged() {
         LDBG(
             "Encountered failure when trying to execute the two-step ping pong "
             "cluster transformation");
+        return;
+      }
+    } else if (tileSize <= 8388608 && aShape[0] == 128 && aShape[1] >= 128 &&
+               elemWidth == 8) {
+      // For smaller block sizes, we move memory access ops and mfmas into 2
+      // clusters
+      kWidth = 16;
+      if (transformTwoClusterMemAndCompute(builder, scaledDotOps[0]->getLoc())
+              .failed()) {
+        LDBG("Encountered failure when trying to execute the ping pong for "
+             "dot_scaled cluster transformation");
         return;
       }
     }
