@@ -10,11 +10,11 @@ from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
 from triton_kernels.matmul_ogs import matmul_ogs, PrecisionConfig, FlexCtx, FnSpecs, FusedActivation
 from triton_kernels.numerics import InFlexData
 from triton_kernels.routing import routing
-from triton_kernels.target_info import is_hip, get_cdna_version
+from triton_kernels.target_info import is_cuda, is_hip, get_cdna_version, cuda_capability_geq
 from triton_kernels.tensor import convert_layout
-from triton_kernels.tensor_details.layout import StridedLayout, BlackwellMXScaleLayout, HopperMXScaleLayout, HopperMXValueLayout
 from triton_kernels.tensor import wrap_torch_tensor, FP4
 from dataclasses import dataclass
+from triton_kernels.tensor_details import layout
 
 if torch.cuda.is_available() and not is_hip():
     from triton._C.libtriton import nvidia
@@ -24,7 +24,7 @@ else:
     cublas = None
 
 
-def quantize(w, dtype, dev, **opt):
+def quantize(w, dtype, **opt):
     if dtype == "bf16":
         wq = w.to(torch.bfloat16).transpose(-1, -2).contiguous().transpose(-1, -2)
         return wq, InFlexData(), None
@@ -32,12 +32,15 @@ def quantize(w, dtype, dev, **opt):
         fp8e4_dtype = torch.float8_e4m3fn if get_cdna_version() != 3 \
             else torch.float8_e4m3fnuz
         wq = w.to(fp8e4_dtype)
+        if is_cuda() and not cuda_capability_geq(10, 0):
+            wq = wq.transpose(-1, -2).contiguous().transpose(-1, -2)
         return wq, InFlexData(dtype=wq.dtype, scale=w.abs().max().unsqueeze(0)), None
     else:
         assert dtype == "mx4", f"{dtype=}"
         w, w_scale = downcast_to_mxfp(w.to(torch.bfloat16), torch.uint8, axis=1)
-        #w = convert_layout(wrap_torch_tensor(w, dtype=FP4), opt["value_layout"])
-        #w_scale = convert_layout(wrap_torch_tensor(w_scale), opt["scale_layout"])
+        # if opt:
+        #     w = convert_layout(wrap_torch_tensor(w, dtype=FP4), opt["value_layout"], **opt["value_layout_opts"])
+        #     w_scale = convert_layout(wrap_torch_tensor(w_scale), opt["scale_layout"], **opt["scale_layout_opts"])
         return w, InFlexData(), w_scale
 
 
@@ -103,18 +106,16 @@ def bench_mlp(batch, dim1, dim2, dim3, n_expts_tot, n_expts_act, x_dtype, w_dtyp
     opt1 = dict()
     opt2 = dict()
     if w_dtype == "mx4" and not is_hip():
-        value_layout = StridedLayout
-        scale_layout = StridedLayout
-        if torch.cuda.get_device_capability()[0] == 9:
-            value_layout = HopperMXValueLayout
-            scale_layout = HopperMXScaleLayout
-        if torch.cuda.get_device_capability()[0] == 10:
-            scale_layout = BlackwellMXScaleLayout
-        opt1 = {"value_layout": value_layout, "scale_layout": scale_layout}
+        num_warps = 4 if batch <= 512 else 8
+        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(mx_axis=1)
+        scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
+            mx_axis=1, num_warps=num_warps)
+        opt1 = {"value_layout": value_layout, "value_layout_opts": value_layout_opts, \
+                "scale_layout": scale_layout, "scale_layout_opts": scale_layout_opts}
         opt2 = deepcopy(opt1)
-    wg, wg_flex, wg_scale = quantize(wg, "bf16", dev, **optg)
-    w1, w1_flex, w1_scale = quantize(w1, w_dtype, dev, **opt1)
-    w2, w2_flex, w2_scale = quantize(w2, w_dtype, dev, **opt2)
+    wg, wg_flex, wg_scale = quantize(wg, "bf16", **optg)
+    w1, w1_flex, w1_scale = quantize(w1, w_dtype, **opt1)
+    w2, w2_flex, w2_scale = quantize(w2, w_dtype, **opt2)
     pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=wg_flex), weight_scale=wg_scale)
     act = FusedActivation(FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")), (1.0, None), 2)
     pc1 = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w1_flex), weight_scale=w1_scale)
@@ -192,7 +193,16 @@ def roofline_mlp(batch_ranges, dim1, dim2, dim3, n_expts_tot, n_expts_act, x_dty
     ax.set_ylim(100, max_tflops + 500)
     # plot roofline
     opints = [p.opint for p in perfs]
-    knee = bisect_left(opints, max_tflops / max_tbps) - 1
+    knee = bisect_left(opints, max_tflops / max_tbps)
+    if knee > 0:  # has a bandwidth-bound knee
+        x_bw = [xs[0], xs[knee - 1]]
+        y_bw = [opints[0] * max_tbps, max_tflops]
+    else:  # no knee found, compute-bound only
+        x_bw = y_bw = []
+    x_comp = xs[knee:]
+    y_comp = [max_tflops] * len(x_comp)
+    ax.plot(x_bw, y_bw, "--", label=f"BW-bound  ({max_tbps:.1f} TB/s)", color="blue")
+    ax.plot(x_comp, y_comp, "--", label=f"Compute-bound  ({max_tflops:.0f} TFLOP/s)", color="orange")
     x_bw, x_comp = xs[:knee], xs[knee:]
     x_bw = [x_bw[0], x_comp[0]]
     y_bw = [opints[0] * max_tbps, max_tflops]

@@ -275,13 +275,15 @@ class CUDABackend(BaseBackend):
             passes.common.add_canonicalizer(pm)
             passes.ttir.add_triton_licm(pm)
             passes.ttgpuir.add_optimize_accumulator_init(pm)
-            passes.ttgpuir.add_hoist_tmem_alloc(pm)
+            passes.ttgpuir.add_hoist_tmem_alloc(pm, False)
             nvidia.passes.ttnvgpuir.add_promote_lhs_to_tmem(pm)
             passes.ttgpuir.add_assign_latencies(pm, opt.num_stages)
             passes.ttgpuir.add_schedule_loops(pm)
             passes.ttgpuir.add_warp_specialize(pm, opt.num_stages)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+            # hoist again and allow hoisting out of if statements
+            passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
             nvidia.passes.ttnvgpuir.add_remove_tmem_tokens(pm)
         else:
             passes.ttir.add_triton_licm(pm)
@@ -435,6 +437,10 @@ class CUDABackend(BaseBackend):
             ]
             try:
                 subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog)
+                if knobs.nvidia.dump_ptxas_log:
+                    with open(flog.name) as log_file:
+                        print(log_file.read())
+
                 if os.path.exists(fsrc.name):
                     os.remove(fsrc.name)
                 if os.path.exists(flog.name):
@@ -452,9 +458,20 @@ class CUDABackend(BaseBackend):
                 else:
                     error = f'`ptxas` failed with error code {e.returncode}'
 
-                raise PTXASError(f"{error}\n"
-                                 f"`ptxas` stderr:\n{log}\n"
-                                 f'Repro command: {" ".join(ptxas_cmd)}\n')
+                error = (f"{error}\n"
+                         f"`ptxas` stderr:\n{log}\n"
+                         f'Repro command: {" ".join(ptxas_cmd)}\n')
+
+                print(f"""
+
+================================================================
+{error}
+
+{src}
+================================================================
+please share the reproducer above with Triton project.
+""")
+                raise PTXASError(error)
 
             with open(fbin, 'rb') as f:
                 cubin = f.read()
