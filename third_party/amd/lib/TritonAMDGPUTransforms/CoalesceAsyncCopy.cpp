@@ -79,6 +79,9 @@ struct CoalesceAsyncCopyWrites
           copyOp, "could not find layout config to create coalesced writes");
     }
 
+    // llvm::outs() << "dstTy: " << dstTy << "\n";
+    // llvm::outs() << "blockedEnc: " << blockedEnc << "\n";
+
     // Do not rewrite if we already use the correct contiguity (could be from a
     // previous rewrite)
     auto contigPerThread = ttg::getContigPerThread(srcTy);

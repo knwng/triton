@@ -406,6 +406,8 @@ def matmul_ogs(x, w, bias,
         routing_data = RoutingData(None, None, max(1, w.shape[0]), 1)
     # unpack scales
     w_scale = precision_config.weight_scale
+    # if w_scale is not None:
+    #     w_scale = w_scale.contiguous()
     w_has_mx = w_scale is not None
     is_hopper_fp8 = is_cuda() and not target_info.cuda_capability_geq(10, 0) and bitwidth(w.dtype) == 8
     if w_has_mx: assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
@@ -528,6 +530,8 @@ def matmul_ogs(x, w, bias,
     out_scale_strides = (0, ) * (3 - len(out_scale_strides)) + out_scale_strides
     # launch kernel
     kernels = get_kernels(epilogue.specs, fused_activation.specs)
+    # print(f'{opt_flags=}')
+    # print(f'{w.stride()=}, {w.shape=}')
     (kernels._p_matmul_ogs if opt_flags.is_persistent else kernels._matmul_ogs)[(grid,)](
                    flex.out_data.reinterpret(memory["output"]),
                    flex.out_data.reinterpret(out0), *out0.stride(),

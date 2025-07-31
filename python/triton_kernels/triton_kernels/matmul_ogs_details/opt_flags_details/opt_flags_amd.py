@@ -21,7 +21,7 @@ def compute_block_nk(n, block_m, grid_m, num_xcds, lhs_dtype, rhs_dtype, precisi
         block_n = 128
 
     if get_cdna_version() == 4 and block_m == 128:
-        block_n = 512
+        block_n = 128
 
     # block_k needs to match the cacheline size (128B)
     block_k = int(128 // min(lhs_width, rhs_width))
@@ -30,4 +30,7 @@ def compute_block_nk(n, block_m, grid_m, num_xcds, lhs_dtype, rhs_dtype, precisi
     #       perhaps due to increased number of k loops to pipeline
     if precision_config.weight_scale is not None and get_cdna_version() != 4:
         block_k = 128
+    
+    if precision_config.weight_scale is not None:
+        block_k = 256
     return block_n, block_k

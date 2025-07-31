@@ -269,6 +269,21 @@ getSharedEncIfAllUsersAreDotEnc(Value loadedValue) {
               ctaLayout, opIdx, srcTy.getShape(), order, vecSize, bitWidth,
               /*needTrans=*/false);
         }
+      } else if (auto blockedEnc =
+                     dyn_cast<ttg::BlockedEncodingAttr>(userResEnc)) {
+        // This is just a workaround for whose user is UpcastMXFP instead of dot
+        unsigned opIdx;
+        if (auto dotEnc = getDotEncoding(userResult, &opIdx)) {
+          unsigned vecSize =
+              blockedEnc
+                  .toLinearLayout(
+                      cast<RankedTensorType>(userResType).getShape())
+                  .getNumConsecutiveInOut();
+          LDBG("deduced opIdx: " << opIdx << "; deduced vecSize: " << vecSize);
+          tempAttr = dotEnc.composeSharedLayoutForOperand(
+              ctaLayout, opIdx, srcTy.getShape(), order, vecSize, bitWidth,
+              /*needTrans=*/false);
+        }
       }
     }
     // Check that the shared encodings needed by the users are compatible.
@@ -306,7 +321,15 @@ bool canBeConvertedToAsyncLoad(unsigned numBuffers, tt::LoadOp loadOp,
   unsigned vecSize = regToSharedLayout.getNumConsecutiveInOut();
   unsigned elemBitWidth = dstTy.getElementTypeBitWidth();
 
-  if (fitToValidDirectToLdsVecSize(vecSize, elemBitWidth, targetInfo) == 0)
+  // llvm::outs() << "srcShape: (" << srcShape[0] << ", " << srcShape[1]
+  //              << "), size: " << srcShape.size() << "\n";
+  // llvm::outs() << "sharedLayout: " << sharedLayout << "\n";
+  // llvm::outs() << "vecSize: " << vecSize << "\n";
+  // llvm::outs() << "elemBitWidth: " << elemBitWidth << "\n";
+
+  unsigned maxVecSize = fitToValidDirectToLdsVecSize(vecSize, elemBitWidth, targetInfo);
+  // llvm::outs() << "maxVecSize: " << maxVecSize << "\n";
+  if (maxVecSize == 0)
     return false;
 
   // Checks whether the global pointer's contiguity and mask alignment allows
@@ -348,6 +371,7 @@ createStreamOps(const LoadToInfoMap &loadToInfo, scf::ForOp &forOp,
 
   LoadToStreamOpMap loadToStreamOp;
   for (auto &[l, info] : loadToInfo) {
+    // llvm::outs() << "load: " << *l << "\n";
     if (!info.sharedEncoding)
       continue;
 

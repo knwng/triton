@@ -329,51 +329,71 @@ struct DotOpMFMAConversionHelper {
     SmallVector<int64_t> fcStrides =
         computeStrides({numRepB, numRepM, numRepN, elemsPerVec});
 
+    int halfPoint = numVecInKBase * numRepB * numRepM * numRepN / 2;
+    int currIter = 0;
+    bool is2Step = false;
+    int innerK = 0, outerK = 0, innerKBound = 1, outerKBound = 1;
+    if (auto pingpongUnitAttr = op->getAttr("pingpong_2step")) {
+      is2Step = true;
+      outerKBound = numVecInKBase;
+    } else
+      innerKBound = numVecInKBase;
+
     Value firstMfma;
     auto vecTy = vec_ty(dstElemTy, elemsPerVec);
-    for (int b = 0; b < numRepB; ++b) {
-      for (int m = 0; m < numRepM; ++m) {
-        for (int n = 0; n < numRepN; ++n) {
-          Value acc = tb.undef(vecTy);
-
-          for (int v = 0; v < elemsPerVec; ++v) {
-            int linearIdx = linearize({b, m, n, v}, fcStrides);
-            Value c = fc[linearIdx];
-            acc = tb.insert_element(vecTy, acc, c, tb.i32_val(v));
-          }
-
-          for (int k = 0; k < numVecInKBase; ++k) {
-            Value op1 = operandA[{b, m, k}];
-            Value op2 = operandB[{b, n, k}];
-            int cbsz = 0;
-            int abid = 0;
-
-            if (numBroadcastA > 1) {
-              assert(!mfmaLayout.getIsTransposed());
-              cbsz = llvm::Log2_32(numBroadcastA);
-              abid = k % numBroadcastA;
-              op1 = operandA[{b, m, k / numBroadcastA}];
+    for (outerK = 0; outerK < outerKBound; outerK++) {
+      for (int b = 0; b < numRepB; ++b) {
+        for (int m = 0; m < numRepM; ++m) {
+          for (int n = 0; n < numRepN; ++n) {
+            // Insert pingpong cluster barrier when needed.
+            if (is2Step && currIter++ == halfPoint) {
+              rewriter.create<ROCDL::SchedBarrier>(loc, 0);
+              rewriter.create<ROCDL::SBarrierOp>(loc);
+              rewriter.create<ROCDL::SchedBarrier>(loc, 0);
             }
 
-            if (numBroadcastB > 1) {
-              assert(numBroadcastA == 1);
-              assert(mfmaLayout.getIsTransposed());
-              cbsz = llvm::Log2_32(numBroadcastB);
-              abid = k % numBroadcastB;
-              op2 = operandB[{b, n, k / numBroadcastB}];
+            Value acc = tb.undef(vecTy);
+
+            for (int v = 0; v < elemsPerVec; ++v) {
+              int linearIdx = linearize({b, m, n, v}, fcStrides);
+              Value c = fc[linearIdx];
+              acc = tb.insert_element(vecTy, acc, c, tb.i32_val(v));
             }
 
-            if (mfmaLayout.getIsTransposed())
-              std::swap(op1, op2);
+            for (innerK = 0; innerK < innerKBound; innerK++) {
+              int k = is2Step ? outerK : innerK;
+              Value op1 = operandA[{b, m, k}];
+              Value op2 = operandB[{b, n, k}];
+              int cbsz = 0;
+              int abid = 0;
 
-            acc = generateMFMAOp(intrinsicName, op1, op2, acc, cbsz, abid);
+              if (numBroadcastA > 1) {
+                assert(!mfmaLayout.getIsTransposed());
+                cbsz = llvm::Log2_32(numBroadcastA);
+                abid = k % numBroadcastA;
+                op1 = operandA[{b, m, k / numBroadcastA}];
+              }
 
-            if (!firstMfma)
-              firstMfma = acc;
+              if (numBroadcastB > 1) {
+                assert(numBroadcastA == 1);
+                assert(mfmaLayout.getIsTransposed());
+                cbsz = llvm::Log2_32(numBroadcastB);
+                abid = k % numBroadcastB;
+                op2 = operandB[{b, n, k / numBroadcastB}];
+              }
+
+              if (mfmaLayout.getIsTransposed())
+                std::swap(op1, op2);
+
+              acc = generateMFMAOp(intrinsicName, op1, op2, acc, cbsz, abid);
+
+              if (!firstMfma)
+                firstMfma = acc;
+            }
+
+            adjustAccForSmallKDim(fc, acc, dstElemTy, b, m, n, numRepM, numRepN,
+                                  kDimInstrSize, kDimOperandSize, elemsPerVec);
           }
-
-          adjustAccForSmallKDim(fc, acc, dstElemTy, b, m, n, numRepM, numRepN,
-                                kDimInstrSize, kDimOperandSize, elemsPerVec);
         }
       }
     }

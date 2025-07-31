@@ -41,6 +41,7 @@ def quantize(w, dtype, **opt):
         # if opt:
         #     w = convert_layout(wrap_torch_tensor(w, dtype=FP4), opt["value_layout"], **opt["value_layout_opts"])
         #     w_scale = convert_layout(wrap_torch_tensor(w_scale), opt["scale_layout"], **opt["scale_layout_opts"])
+        # return w, InFlexData(), w_scale
         return w, InFlexData(), w_scale
 
 
@@ -133,16 +134,43 @@ def bench_mlp(batch, dim1, dim2, dim3, n_expts_tot, n_expts_act, x_dtype, w_dtyp
     xg = x.to(wg.dtype if n_expts_tot > 1 else x_dtype)
     x = x.to(x_dtype)
     # run layer
-    proton.start(str(fpath.with_suffix('')), hook="triton")
-    for i in range(100):
-        if n_expts_tot > 1:
-            logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
-            rdata, gather_indx, scatter_indx = routing(logits, n_expts_act, simulated_ep=EP)
-        else:
-            rdata, gather_indx, scatter_indx = None, None, None
-        x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
-        x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2)
-    proton.finalize()
+    action = 'normal' # normal, record, profile
+
+    CACHE_FN = f"moe_cache_pingpong/moe_cache_pingpong_{w_dtype}_{batch}.pt"
+    import os
+    os.makedirs('./moe_cache_pingpong/', exist_ok=True)
+    if action == 'profile':
+        cache = torch.load(CACHE_FN, weights_only=False)
+        for i in range(100):
+            rdata, gather_indx, scatter_indx, x = cache
+            x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
+    elif action == 'record':
+        cache = []
+        proton.start(str(fpath.with_suffix('')), hook="triton")
+        for i in range(100):
+            if n_expts_tot > 1:
+                logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
+                rdata, gather_indx, scatter_indx = routing(logits, n_expts_act, simulated_ep=EP)
+            else:
+                rdata, gather_indx, scatter_indx = None, None, None
+            cache = (rdata, gather_indx, scatter_indx, x)
+            x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
+            x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2)
+        proton.finalize()
+        torch.save(cache, CACHE_FN)
+    elif action == 'normal':
+        proton.start(str(fpath.with_suffix('')), hook="triton")
+        for i in range(100):
+            if n_expts_tot > 1:
+                logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
+                rdata, gather_indx, scatter_indx = routing(logits, n_expts_act, simulated_ep=EP)
+            else:
+                rdata, gather_indx, scatter_indx = None, None, None
+            x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
+            x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2)
+        proton.finalize()
+    else:
+        raise ValueError("Invalid action, should be one of normal, record, profile")
 
     # -- analyze --
     gf, _, _, info = viewer.read(fpath)
@@ -224,10 +252,10 @@ if __name__ == "__main__":
     #batch_ranges_moe = [(4096, 4200, 128)] #130, 32)]
     #batch_ranges_moe = [(32, 130, 32), (1024, 4100, 1024)]
     # batch_ranges_moe = [(8, 18, 8), (32, 130, 32), (1024, 4100, 1024), (8192, 8200, 32)]
-    batch_ranges_moe = [(4096, 4100, 1024), (8192, 8200, 32)]
+    # batch_ranges_moe = [(4096, 4100, 1024), (8192, 8200, 32)]
+    batch_ranges_moe = [(8192, 8200, 32)]
     #batch_ranges_moe = [(32, 40, 32)]
     #dense_dtypes = ["fp8", "fp8"]
-    #quantized_dtypes = ["bf16", "mx4"] #if has_native_mx4 else ["bf16", "mx4"]
     quantized_dtypes = ["bf16", "mx4"]
     #roofline_mlp(batch_ranges_dense, 8192, 8192, 1, 1, *dense_dtypes, TP=1, EP=1, name="dense")
     #roofline_mlp(batch_ranges_dense, 5760, 2880, 1, 1, *quantized_dtypes, TP=1, EP=1, name="dense")
@@ -235,4 +263,6 @@ if __name__ == "__main__":
     #roofline_mlp(batch_ranges_moe, 2880, 5888, 3072, 128, 4, *quantized_dtypes, TP=1, EP=1, name="oai")
     roofline_mlp(batch_ranges_moe, 3072, 5888, 3072, 128, 4, *quantized_dtypes, TP=1, EP=1, name="oai")
     #roofline_mlp(batch_ranges_moe, 2880, 768, 3072, 128, 4, *quantized_dtypes, TP=1, EP=1, name="oai")
-    #roofline_mlp(batch_ranges_moe, 3072, 768, 3072, 128, 4, *quantized_dtypes, TP=1, EP=1, name="oai")
+    # quantized_dtypes = ["fp8", "mx4"]
+    # roofline_mlp(batch_ranges_moe, 3072, 5888, 3072, 128, 4, *quantized_dtypes, TP=1, EP=1, name="oai")
+    # roofline_mlp(batch_ranges_moe, 3072, 768, 3072, 128, 4, *quantized_dtypes, TP=1, EP=1, name="oai")

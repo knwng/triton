@@ -1,6 +1,7 @@
 # isort: off
 # fmt: off
 from dataclasses import dataclass
+from triton_kernels.tensor import bitwidth
 import triton
 from triton_kernels.target_info import get_cdna_version
 import torch
@@ -67,6 +68,9 @@ def make_default_opt_flags_amd(
     elif is_cdna4 and m >= 512:
         block_m = 128
     else:
+        # if precision_config.weight_scale is not None:
+        #     block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 64))
+        # else:
         block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
 
     if routing_data is not None:
@@ -103,10 +107,28 @@ def make_default_opt_flags_amd(
     num_stages = 2
     # AMD-specific
     target_kernel_kwargs = {"waves_per_eu": 0, "matrix_instr_nonkdim": 16, "kpack": 1}
+    if precision_config.weight_scale is not None and bitwidth(lhs_dtype) == 16 and bitwidth(rhs_dtype) == 4:
+    #     # case 1
+        block_m = 128
+        block_n = 512 # 512
+        block_k = 128
+        num_stages = 2
+
+    #     # case 2
+    #     # block_m = 256
+    #     # block_n = 256
+    #     # block_k = 32
+    #     # num_stages = 3
+
+    #     # block_m = 64
+    #     # block_n = 256
+    #     # block_k = 256
+    #     # num_stages = 2
+
     ret = OptFlags(
         block_m=block_m,
-        block_n=128, #block_n,
-        block_k=128, #block_k,
+        block_n=block_n,
+        block_k=block_k,
         num_warps=8, #num_warps,
         num_stages=num_stages,
         group_m=group_m,

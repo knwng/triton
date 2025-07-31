@@ -85,6 +85,8 @@ private:
                                                        Location loc);
   LogicalResult transformTwoClusterWithAsyncAndAll(OpBuilder &builder,
                                                    Location loc);
+  LogicalResult transformTwoClusterMemAndCompute(OpBuilder &builder,
+                                                 Location loc);
   LogicalResult transformChainedDotSchedule(OpBuilder &builder, Location loc);
   void addAsymmetricSyncToLoop(OpBuilder &builder, Location loc);
   void updateOpInsertion(Operation *Op);
@@ -667,6 +669,34 @@ LogicalResult Pingponger::transformTwoClusterWithAsyncAndAll(OpBuilder &builder,
   return success();
 }
 
+LogicalResult Pingponger::transformTwoClusterMemAndCompute(OpBuilder &builder,
+                                                           Location loc) {
+  LDBG("Enter transformTwoClusterMemAndCompute");
+  if (asyncCopyOps.size() == 0)
+    return failure();
+  builder.setInsertionPointAfter(asyncWaitOps[0]);
+  updateOpInsertion(asyncWaitOps[0]);
+
+  // mem cluster contains async_copies and tt.load if LDS bypassed.
+  for (auto cop : asyncCommitOps)
+    moveOpAndPredecessorsUpSameBlock(cop);
+  for (auto glop : gLoadOps)
+    moveOpAndPredecessorsUpSameBlock(glop);
+  for (auto llop : lLoadOps)
+    moveOpAndPredecessorsUpSameBlock(llop);
+
+  appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
+  appendOp(builder.create<ROCDL::SBarrierOp>(loc));
+  appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
+
+  // all other ops are placed in the second cluster
+  // set unit attr, so it can trigger the second step in the ttg to llvm
+  // lowering pass.
+  // dotOps[0]->setAttr("pingpong_2step", builder.getUnitAttr());
+
+  return success();
+}
+
 // For ChainedDots with num_stage==4 the pipeliner already places ops in the
 // correct order to allow for efficient pingpong. The loop contains 2 pairs of
 // compute and memory clusters so we only have to place barriers/sched.barriers
@@ -970,9 +1000,21 @@ void Pingponger::getDotPingponged() {
     }
     if (numStages > 2 && dotOps.size() == 1 && tileSize == mediumTile &&
         aShape[1] == 32 && elemWidth == 16) {
+    // if (numStages > 2 && dotOps.size() == 1 && dotShape[0] >= 64 &&
+    //     dotShape[1] >= 64 && elemWidth == 16) {
       if (transformTwoClusterWithLocalLoadAndAll(builder, loc).failed()) {
         LDBG("Encountered failure when trying to execute the NS3 ping pong "
              "cluster transformation");
+        return;
+      }
+      addAsymmetricSyncToLoop(builder, loc);
+      return;
+    }
+
+    if (numStages == 2 && tileSize == 134217728 && elemWidth == 16) {
+      if (transformTwoClusterMemAndCompute(builder, loc).failed()) {
+        LDBG("Encountered failure when trying to execute the 2 stages async "
+             "copy ping pong transformation");
         return;
       }
       addAsymmetricSyncToLoop(builder, loc);
@@ -1006,11 +1048,11 @@ void Pingponger::getDotPingponged() {
                             });
   if (estimateNonDotMemoryImpact<tt::LoadOp>(gLoadIt, gLoadOps.end(),
                                              assumeNotTaken) != 0) {
-    std::stringstream message;
-    message << "Unable to match ping pong scheduling pattern. Details: "
-            << "Non-dot global loads found in non-persistent GEMM";
-    LDBG(message.str());
-    return;
+    // std::stringstream message;
+    // message << "Unable to match ping pong scheduling pattern. Details: "
+    //         << "Non-dot global loads found in non-persistent GEMM";
+    // LDBG(message.str());
+    // return;
   }
   if (estimateNonDotMemoryImpact<ttg::LocalLoadOp>(lLoadIt, lLoadOps.end(),
                                                    assumeNotTaken) != 0) {
@@ -1035,11 +1077,13 @@ void Pingponger::getDotPingponged() {
   lStoreOps.erase(lStoreIt, lStoreOps.end());
   // All PingPong Scheduler assumes there are 2 movable global loads and 2
   // movable local loads.
-  if (gLoadOps.size() != 2 || lLoadOps.size() != 2) {
+  if ((gLoadOps.size() != 2 && asyncCopyOps.size() != 2) ||
+      lLoadOps.size() != 2) {
     std::stringstream message;
     message << "Unable to match ping pong slicing pattern. Details: "
             << gLoadOps.size() << " global loads in dot computation, "
-            << lLoadOps.size() << " local loads in dot computation";
+            << lLoadOps.size() << " local loads in dot computation, "
+            << asyncCopyOps.size() << " async copy in dot computation";
     LDBG(message.str());
     return;
   }
