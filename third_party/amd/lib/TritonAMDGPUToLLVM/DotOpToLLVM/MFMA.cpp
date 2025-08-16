@@ -725,7 +725,8 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     int numVecInKBase = numRepK * aKWidth / aKBase;
 
     // int halfPoint = numVecInKBase * numRepB * numRepM * numRepN / 2;
-    int halfPoint = numVecInKBase * numRepB * numRepM * numRepN;
+    int halfPoint = numVecInKBase * numRepB * numRepM * numRepN / 4;
+    // int halfPoint = numVecInKBase * numRepB * numRepM * numRepN;
     int currIter = 0;
     bool is2Step = false;
     int innerK = 0, outerK = 0, innerKBound = 1, outerKBound = 1;
@@ -745,11 +746,11 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
         for (int m = 0; m < numRepM; ++m) {
           for (int n = 0; n < numRepN; ++n) {
             // Insert pingpong cluster barrier when needed.
-            // if (is2Step && currIter++ == halfPoint) {
-            //   rewriter.create<ROCDL::SchedBarrier>(loc, 0);
-            //   rewriter.create<ROCDL::SBarrierOp>(loc);
-            //   rewriter.create<ROCDL::SchedBarrier>(loc, 0);
-            // }
+            if (is2Step && currIter++ == halfPoint) {
+              rewriter.create<ROCDL::SchedBarrier>(loc, 0);
+              rewriter.create<ROCDL::SBarrierOp>(loc);
+              rewriter.create<ROCDL::SchedBarrier>(loc, 0);
+            }
             Value acc = tb.undef(vecTy);
             for (unsigned v = 0; v < elemsPerVec; ++v) {
               acc = tb.insert_element(

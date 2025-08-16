@@ -140,23 +140,77 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
     xg = x.to(wg.dtype if n_expts_tot > 1 else x_dtype)
     x = x.to(x_dtype)
     # run layer
-    CACHE_FN = f"moe_cache_pingpong/moe_cache_pingpong_{w_dtype}_{batch}.pt"
+    # CACHE_FN = f"moe_cache_pingpong/moe_cache_pingpong_{w_dtype}_{batch}.pt"
+    # os.makedirs('./moe_cache_pingpong/', exist_ok=True)
+    # cache = []
+    # # cache = torch.load(CACHE_FN, weights_only=False)
+    # proton.start(str(fpath.with_suffix('')), hook="triton")
+    # for i in range(100):
+    #     if n_expts_tot > 1:
+    #         logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
+    #         rdata, gather_indx, scatter_indx = routing(logits, n_expts_act, simulated_ep=EP)
+    #     else:
+    #         rdata, gather_indx, scatter_indx = None, None, None
+    #     # cache = (rdata, gather_indx, scatter_indx, x)
+    #     # rdata, gather_indx, scatter_indx, x = cache
+    #     x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
+    #     x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2)
+    # proton.finalize()
+    # # torch.save(cache, CACHE_FN)
+
+
+    action = 'normal' # normal, record, profile, 2nd
+
+    CACHE_FN = f"moe_cache_pingpong/moe_cache_pingpong_{x_dtype}_{w_dtype}_{batch}.pt"
     os.makedirs('./moe_cache_pingpong/', exist_ok=True)
-    cache = []
-    # cache = torch.load(CACHE_FN, weights_only=False)
-    proton.start(str(fpath.with_suffix('')), hook="triton")
-    for i in range(100):
-        if n_expts_tot > 1:
-            logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
-            rdata, gather_indx, scatter_indx = routing(logits, n_expts_act, simulated_ep=EP)
-        else:
-            rdata, gather_indx, scatter_indx = None, None, None
-        # cache = (rdata, gather_indx, scatter_indx, x)
-        # rdata, gather_indx, scatter_indx, x = cache
-        x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
-        x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2)
-    proton.finalize()
-    # torch.save(cache, CACHE_FN)
+    if action == 'profile':
+        cache = torch.load(CACHE_FN, weights_only=False)
+        for i in range(100):
+            rdata, gather_indx, scatter_indx, x, _ = cache
+            x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
+    elif action == '2nd':
+        cache = torch.load(CACHE_FN, weights_only=False)
+        proton.start(str(fpath.with_suffix('')), hook="triton")
+        for i in range(100):
+            rdata, gather_indx, scatter_indx, x, _ = cache
+            x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
+        proton.finalize()
+    elif action == '2nd':
+        cache = torch.load(CACHE_FN, weights_only=False)
+        proton.start(str(fpath.with_suffix('')), hook="triton")
+        for i in range(100):
+            rdata, gather_indx, scatter_indx, _, x = cache
+            x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2)
+        proton.finalize()
+    elif action == 'record':
+        cache = []
+        proton.start(str(fpath.with_suffix('')), hook="triton")
+        for i in range(100):
+            if n_expts_tot > 1:
+                logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
+                rdata, gather_indx, scatter_indx = routing(logits, n_expts_act, simulated_ep=EP)
+            else:
+                rdata, gather_indx, scatter_indx = None, None, None
+            cache = [rdata, gather_indx, scatter_indx, x]
+            x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
+            cache.append(x)
+            x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2)
+        proton.finalize()
+        torch.save(cache, CACHE_FN)
+    elif action == 'normal':
+        proton.start(str(fpath.with_suffix('')), hook="triton")
+        for i in range(100):
+            if n_expts_tot > 1:
+                logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
+                rdata, gather_indx, scatter_indx = routing(logits, n_expts_act, simulated_ep=EP)
+            else:
+                rdata, gather_indx, scatter_indx = None, None, None
+            x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
+            x = matmul_ogs(x, w2, b2, rdata, scatter_indx=scatter_indx, precision_config=pc2)
+        proton.finalize()
+    else:
+        raise ValueError("Invalid action, should be one of normal, record, profile")
+
 
     # -- analyze --
     gf, _, _, info = viewer.read(fpath)
@@ -188,46 +242,46 @@ def roofline_mlp(batch_ranges, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_
             print(f"Batch: {batch}; Util: {perfs[-1].util}; TFLOPS: {perfs[-1].tflops}; TBPS: {perfs[-1].tbps}")
     print("===============================================================")
     # machine limits
-    max_tbps = perfs[0].max_tbps
-    max_tflops = perfs[0].max_tflops
-    fig, ax = plt.subplots(figsize=(7, 5), dpi=120)
-    ax.set_xlabel("batch size (toks/expt)")
-    ax.set_ylabel("performance  [TFLOP/s]")
-    ax.set_title(f"{bench_case} roofline")
-    # add a tiny margin so points are not flush with the frame
-    xs = [batch * n_expts_act / n_expts_tot for batch in batches]
-    perf = [p.tflops for p in perfs]
-    xmin, xmax = min(xs), max(xs)
-    dx = 0.05 * (xmax - xmin) if xmax > xmin else 1.0
-    ax.set_xlim(xmin - dx, xmax + dx)
-    ax.set_ylim(100, max_tflops + 500)
-    # plot roofline
-    opints = [p.opint for p in perfs]
-    knee = bisect_left(opints, max_tflops / max_tbps) - 1
-    x_bw, x_comp = xs[:knee], xs[knee:]
-    x_bw = [x_bw[0], x_comp[0]]
-    y_bw = [opints[0] * max_tbps, max_tflops]
-    y_comp = [max_tflops] * len(x_comp)
-    ax.plot(x_bw, y_bw, "--", label=f"BW-bound  ({max_tbps:.1f} TB/s)")
-    ax.plot(x_comp, y_comp, "--", label=f"Compute-bound  ({max_tflops:.0f} TFLOP/s)")
-    # plot data
-    ax.scatter(xs, perf, marker="+")
-    ax.legend(frameon=False, loc="lower right")
-    ax.grid(True, which="both", ls=":", lw=0.5)
-    fig.tight_layout()
-    fpath = Path(f"logs/{name}/{x_dtype}-{w_dtype}-TP{TP}-EP{EP}/roofline.png")
-    plt.savefig(fpath)
+    # max_tbps = perfs[0].max_tbps
+    # max_tflops = perfs[0].max_tflops
+    # fig, ax = plt.subplots(figsize=(7, 5), dpi=120)
+    # ax.set_xlabel("batch size (toks/expt)")
+    # ax.set_ylabel("performance  [TFLOP/s]")
+    # ax.set_title(f"{bench_case} roofline")
+    # # add a tiny margin so points are not flush with the frame
+    # xs = [batch * n_expts_act / n_expts_tot for batch in batches]
+    # perf = [p.tflops for p in perfs]
+    # xmin, xmax = min(xs), max(xs)
+    # dx = 0.05 * (xmax - xmin) if xmax > xmin else 1.0
+    # ax.set_xlim(xmin - dx, xmax + dx)
+    # ax.set_ylim(100, max_tflops + 500)
+    # # plot roofline
+    # opints = [p.opint for p in perfs]
+    # knee = bisect_left(opints, max_tflops / max_tbps) - 1
+    # x_bw, x_comp = xs[:knee], xs[knee:]
+    # x_bw = [x_bw[0], x_comp[0]]
+    # y_bw = [opints[0] * max_tbps, max_tflops]
+    # y_comp = [max_tflops] * len(x_comp)
+    # ax.plot(x_bw, y_bw, "--", label=f"BW-bound  ({max_tbps:.1f} TB/s)")
+    # ax.plot(x_comp, y_comp, "--", label=f"Compute-bound  ({max_tflops:.0f} TFLOP/s)")
+    # # plot data
+    # ax.scatter(xs, perf, marker="+")
+    # ax.legend(frameon=False, loc="lower right")
+    # ax.grid(True, which="both", ls=":", lw=0.5)
+    # fig.tight_layout()
+    # fpath = Path(f"logs/{name}/{x_dtype}-{w_dtype}-TP{TP}-EP{EP}/roofline.png")
+    # plt.savefig(fpath)
 
 
 if __name__ == "__main__":
     has_native_mx4 = torch.cuda.get_device_capability(0)[0] >= 10 or get_cdna_version() == 4
     batch_ranges_dense = [(1024, 32768, 1024)]
-    batch_ranges_moe = [(128, 512, 32), (512, 32000, 128)]
-    # batch_ranges_moe = [(1024, 32768, 1024)]
+    # batch_ranges_moe = [(128, 512, 32), (512, 32000, 128)]
+    batch_ranges_moe = [(1024, 32768, 1024)]
     # batch_ranges_moe = [(31744, 31745, 1024)]
     dense_dtypes = ["fp8", "fp8"]
     quantized_dtypes = ["fp8", "mx4"] if has_native_mx4 else ["bf16", "mx4"]
     # roofline_mlp(batch_ranges_dense, 8192, 8192, 1, 1, *dense_dtypes, TP=1, EP=1, name="dense")
     # roofline_mlp(batch_ranges_dense, 8192, 8192, 1, 1, *quantized_dtypes, TP=1, EP=1, name="dense")
-    roofline_mlp(batch_ranges_moe, 5120, 8192, 128, 4, *dense_dtypes, TP=1, EP=1, name="llama4-maverick")
+    # roofline_mlp(batch_ranges_moe, 5120, 8192, 128, 4, *dense_dtypes, TP=1, EP=1, name="llama4-maverick")
     roofline_mlp(batch_ranges_moe, 5120, 8192, 128, 4, *quantized_dtypes, TP=1, EP=1, name="llama4-maverick")
