@@ -85,6 +85,8 @@ private:
                                                        Location loc);
   LogicalResult transformTwoClusterWithAsyncAndAll(OpBuilder &builder,
                                                    Location loc);
+  LogicalResult transformTwoClusterMemAndCompute(OpBuilder &builder,
+                                                 Location loc);
   LogicalResult transformChainedDotSchedule(OpBuilder &builder, Location loc);
   void addAsymmetricSyncToLoop(OpBuilder &builder, Location loc);
   void updateOpInsertion(Operation *Op);
@@ -667,6 +669,40 @@ LogicalResult Pingponger::transformTwoClusterWithAsyncAndAll(OpBuilder &builder,
   return success();
 }
 
+LogicalResult Pingponger::transformTwoClusterMemAndCompute(OpBuilder &builder,
+                                                           Location loc) {
+  LDBG("Enter transformTwoClusterMemAndCompute");
+  if (asyncCopyOps.size() == 0)
+    return failure();
+  builder.setInsertionPointAfter(asyncWaitOps[0]);
+  updateOpInsertion(asyncWaitOps[0]);
+
+  // mem cluster contains async_copies and tt.load if LDS bypassed.
+  for (auto cop : asyncCommitOps)
+    moveOpAndPredecessorsUpSameBlock(cop);
+
+  appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
+  appendOp(builder.create<ROCDL::SBarrierOp>(loc));
+  appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
+
+  for (auto llop : lLoadOps)
+    moveOpAndPredecessorsUpSameBlock(llop);
+
+  for (auto glop : gLoadOps)
+    moveOpAndPredecessorsUpSameBlock(glop);
+
+  // appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
+  // appendOp(builder.create<ROCDL::SBarrierOp>(loc));
+  // appendOp(builder.create<ROCDL::SchedBarrier>(loc, 0));
+
+  // all other ops are placed in the second cluster
+  // set unit attr, so it can trigger the second step in the ttg to llvm
+  // lowering pass.
+  scaledDotOps[0]->setAttr("pingpong_2step", builder.getUnitAttr());
+
+  return success();
+}
+
 // For ChainedDots with num_stage==4 the pipeliner already places ops in the
 // correct order to allow for efficient pingpong. The loop contains 2 pairs of
 // compute and memory clusters so we only have to place barriers/sched.barriers
@@ -862,8 +898,8 @@ void Pingponger::getDotPingponged() {
             [&](auto pingpongDot) { dotOps.push_back(pingpongDot); })
         .Case<tt::DotScaledOp>(
             [&](auto pingpongDot) { scaledDotOps.push_back(pingpongDot); })
-        .Case<ttg::AsyncCopyGlobalToLocalOp>(
-            [&](auto asyncOp) { asyncCopyOps.push_back(asyncOp); })
+        // .Case<ttg::AsyncCopyGlobalToLocalOp>(
+        //     [&](auto asyncOp) { asyncCopyOps.push_back(asyncOp); })
         .Case<ttg::AsyncCommitGroupOp>([&](auto asyncCommitGroupOp) {
           asyncCommitOps.push_back(asyncCommitGroupOp);
         })
@@ -918,6 +954,14 @@ void Pingponger::getDotPingponged() {
     auto aType = scaledDotOps[0].getA().getType();
     auto aShape = aType.getShape();
     auto elemWidth = aType.getElementTypeBitWidth();
+    int64_t tileSize = scaledDotShape[0] * scaledDotShape[1] * aShape[1];
+
+    bool isfp8mxfp4_128x256x256 = (tileSize == 8388608 && aShape[0] == 128 &&
+                                   aShape[1] == 256 && elemWidth == 8);
+    bool isfp8fp8_128x256x128 = (tileSize == 4194304 && aShape[0] == 128 &&
+                                 aShape[1] == 128 && elemWidth == 8);
+    bool isfp8fp8_128x512x128 = (tileSize == 8388608 && aShape[0] == 128 &&
+                                 aShape[1] == 128 && elemWidth == 8);
 
     // MxN = 256x256
     if (scaledDotShape[0] == 256 && scaledDotShape[1] == 256 &&
@@ -926,6 +970,18 @@ void Pingponger::getDotPingponged() {
               .failed()) {
         LDBG("Encountered failure when trying to execute the"
              "TwoClusterWithAsyncAndAll transformation");
+        return;
+      }
+      addAsymmetricSyncToLoop(builder, loc);
+    } else if (isfp8mxfp4_128x256x256 || isfp8fp8_128x256x128 ||
+               isfp8fp8_128x512x128) {
+      // return;
+      kWidth = 16;
+      if (transformTwoClusterMemAndCompute(builder, scaledDotOps[0]->getLoc())
+              .failed()) {
+        LDBG(
+            "Encountered failure when trying to execute the two-step ping pong "
+            "cluster transformation");
         return;
       }
       addAsymmetricSyncToLoop(builder, loc);

@@ -730,7 +730,9 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
     // and the second cluster with the other half K of mfma.
     // By splitting in K dim, we can retire registers used by the
     // first half of mfma, backend compiler is supposed to schedule it.
-    int halfPoint = numVecInKBase * numRepB * numRepM * numRepN / 2;
+    // int halfPoint = numVecInKBase * numRepB * numRepM * numRepN / 2;
+    int halfPoint = numVecInKBase * numRepB * numRepM * numRepN / 4;
+    // int halfPoint = numVecInKBase * numRepB * numRepM * numRepN;
     int currIter = 0;
     bool is2Step = false;
     int innerK = 0, outerK = 0, innerKBound = 1, outerKBound = 1;

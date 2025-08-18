@@ -104,7 +104,7 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
     # -- numerics --
     opt1 = dict()
     opt2 = dict()
-    if w_dtype == "mx4" and not is_hip():
+    if w_dtype == "mx4":
         num_warps = 4 if batch <= 512 else 8
         value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(mx_axis=1)
         scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
@@ -134,23 +134,103 @@ def bench_mlp(batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP,
 
     input_x = torch.randn((batch // DP, dim1), device=dev)
     # run layer
-    proton.start(str(fpath.with_suffix("")), hook="triton")
+    # proton.start(str(fpath.with_suffix("")), hook="triton")
     input_x = input_x.to(x_dtype)
     xg = input_x.to(wg.dtype if n_expts_tot > 1 else input_x.dtype)
-    for i in range(100):
-        if n_expts_tot > 1:  # sparse
-            logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
-            x, rdata, gather_indx, scatter_indx, metadata = triton_dist.routing(input_x, logits, n_expts_act, EP=EP,
-                                                                                TP=TP)
-        else:  # dense
-            x = triton_dist.all_gather(input_x, dim=0)
-            rdata, gather_indx, scatter_indx, metadata = None, None, None, None
-        if x.nelement() > 0:
-            x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
-            x = matmul_ogs(x, w2, b2 if rank % TP == 0 else None, rdata, scatter_indx=scatter_indx,
-                           precision_config=pc2)
-        x = triton_dist.reduce_scatter(x, metadata=metadata, dim=0)
-    proton.finalize()
+    # for i in range(100):
+    #     if n_expts_tot > 1:  # sparse
+    #         logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
+    #         x, rdata, gather_indx, scatter_indx, metadata = triton_dist.routing(input_x, logits, n_expts_act, EP=EP,
+    #                                                                             TP=TP)
+    #     else:  # dense
+    #         x = triton_dist.all_gather(input_x, dim=0)
+    #         rdata, gather_indx, scatter_indx, metadata = None, None, None, None
+    #     if x.nelement() > 0:
+    #         x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
+    #         x = matmul_ogs(x, w2, b2 if rank % TP == 0 else None, rdata, scatter_indx=scatter_indx,
+    #                        precision_config=pc2)
+    #     x = triton_dist.reduce_scatter(x, metadata=metadata, dim=0)
+    # proton.finalize()
+
+
+    action = 'normal' # normal, record, profile, 2nd, profile_3nd
+
+    CACHE_FN = f"moe_cache_pingpong/moe_cache_pingpong_{x_dtype}_{w_dtype}_{batch}.pt"
+    import os
+    os.makedirs('./moe_cache_pingpong/', exist_ok=True)
+    if action == 'profile':
+        cache = torch.load(CACHE_FN, weights_only=False)
+        for i in range(100):
+            rdata, gather_indx, scatter_indx, metadata, x, _ = cache
+            if x.nelement() > 0:
+                x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
+            x = triton_dist.reduce_scatter(x, metadata=metadata, dim=0)
+    elif action == 'profile_3nd':
+        cache = torch.load(CACHE_FN, weights_only=False)
+        for i in range(100):
+            rdata, gather_indx, scatter_indx, metadata, _, x = cache
+            if x.nelement() > 0:
+                x = matmul_ogs(x, w2, b2 if rank % TP == 0 else None, rdata, scatter_indx=scatter_indx,
+                               precision_config=pc2)
+            x = triton_dist.reduce_scatter(x, metadata=metadata, dim=0)
+    elif action == '2nd':
+        cache = torch.load(CACHE_FN, weights_only=False)
+        proton.start(str(fpath.with_suffix('')), hook="triton")
+        for i in range(100):
+            rdata, gather_indx, scatter_indx, metadata, x, _ = cache
+            if x.nelement() > 0:
+                x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
+            x = triton_dist.reduce_scatter(x, metadata=metadata, dim=0)
+        proton.finalize()
+    elif action == '3rd':
+        cache = torch.load(CACHE_FN, weights_only=False)
+        proton.start(str(fpath.with_suffix('')), hook="triton")
+        for i in range(100):
+            rdata, gather_indx, scatter_indx, metadata, _, x = cache
+            if x.nelement() > 0:
+                x = matmul_ogs(x, w2, b2 if rank % TP == 0 else None, rdata, scatter_indx=scatter_indx,
+                               precision_config=pc2)
+            x = triton_dist.reduce_scatter(x, metadata=metadata, dim=0)
+        proton.finalize()
+    elif action == 'record':
+        cache = []
+        proton.start(str(fpath.with_suffix('')), hook="triton")
+        for i in range(100):
+            if n_expts_tot > 1:  # sparse
+                logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
+                x, rdata, gather_indx, scatter_indx, metadata = triton_dist.routing(input_x, logits, n_expts_act, EP=EP,
+                                                                                    TP=TP)
+            else:  # dense
+                x = triton_dist.all_gather(input_x, dim=0)
+                rdata, gather_indx, scatter_indx, metadata = None, None, None, None
+            cache = [rdata, gather_indx, scatter_indx, metadata, x]
+            if x.nelement() > 0:
+                x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
+                cache.append(x)
+                x = matmul_ogs(x, w2, b2 if rank % TP == 0 else None, rdata, scatter_indx=scatter_indx,
+                               precision_config=pc2)
+            x = triton_dist.reduce_scatter(x, metadata=metadata, dim=0)
+        proton.finalize()
+        torch.save(cache, CACHE_FN)
+    elif action == 'normal':
+        proton.start(str(fpath.with_suffix('')), hook="triton")
+        for i in range(100):
+            if n_expts_tot > 1:  # sparse
+                logits = matmul_ogs(xg, wg, bg, precision_config=pcg)
+                x, rdata, gather_indx, scatter_indx, metadata = triton_dist.routing(input_x, logits, n_expts_act, EP=EP,
+                                                                                    TP=TP)
+            else:  # dense
+                x = triton_dist.all_gather(input_x, dim=0)
+                rdata, gather_indx, scatter_indx, metadata = None, None, None, None
+            if x.nelement() > 0:
+                x = matmul_ogs(x, w1, b1, rdata, gather_indx=gather_indx, precision_config=pc1, fused_activation=act)
+                x = matmul_ogs(x, w2, b2 if rank % TP == 0 else None, rdata, scatter_indx=scatter_indx,
+                               precision_config=pc2)
+            x = triton_dist.reduce_scatter(x, metadata=metadata, dim=0)
+        proton.finalize()
+    else:
+        raise ValueError("Invalid action, should be one of normal, record, profile")
+
 
     # -- analyze --
     gf, _, _, info = viewer.read(fpath)
@@ -258,7 +338,9 @@ if __name__ == "__main__":
             roofline_mlp(batch_ranges_moe, 5120, 8192, 128, 4, *dtypes, TP=args.tp, EP=args.ep, name="llama4-maverick")
         triton_dist.cleanup()
     else:
-        roofline_mlp(batch_ranges_dense, 8192, 8192, 1, 1, *dense_dtypes, TP=1, EP=1, name="dense")
-        roofline_mlp(batch_ranges_dense, 8192, 8192, 1, 1, *quantized_dtypes, TP=1, EP=1, name="dense")
-        roofline_mlp(batch_ranges_moe, 5120, 8192, 128, 4, *dense_dtypes, TP=1, EP=1, name="llama4-maverick")
+        # roofline_mlp(batch_ranges_dense, 8192, 8192, 1, 1, *dense_dtypes, TP=1, EP=1, name="dense")
+        # roofline_mlp(batch_ranges_dense, 8192, 8192, 1, 1, *quantized_dtypes, TP=1, EP=1, name="dense")
+        # roofline_mlp(batch_ranges_moe, 5120, 8192, 128, 4, *dense_dtypes, TP=1, EP=1, name="llama4-maverick")
+        # batch_ranges_moe = [(31744, 31745, 1024)]
+        batch_ranges_moe = [(1024, 32768, 1024)]
         roofline_mlp(batch_ranges_moe, 5120, 8192, 128, 4, *quantized_dtypes, TP=1, EP=1, name="llama4-maverick")
