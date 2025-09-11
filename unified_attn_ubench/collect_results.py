@@ -90,7 +90,7 @@ repeat = args.repeat
 path = args.path
 kernel_names = args.kernel_names
 
-data = pd.read_csv("results_attn.csv")
+data = pd.read_csv("results_attn.csv_kernel_trace.csv")
 kernel_data = defaultdict(list)
 name_map = dict()
 for i, f_name in enumerate(data['Kernel_Name']):
