@@ -882,7 +882,6 @@ enum Clusters {
   CLUSTER_ASYNC_WAIT_2,
   CLUSTER_LOCAL_WRITE_1,
   CLUSTER_LOCAL_LOAD_2,
-  CLUSTER_INDIRECT_LOAD,
   CLUSTER_GLOBAL_LOAD_1,
   // ComputeCluster2
   CLUSTER_DOT_2,
@@ -929,7 +928,6 @@ LogicalResult checkPreconditions(scf::ForOp forOp, int numStages,
     return failure();
   }
 
-
   return success();
 }
 
@@ -939,6 +937,59 @@ scheduleLoads(std::array<tt::DotOp, 2> dotOps,
               const llvm::MapVector<Operation *, LoadInfo> &loadToInfo,
               const ChainedDotClusters &clusters,
               tt::CoarseSchedule &schedule) {
+
+  auto indirectUsedByDot = [&](Operation *load, LoadInfo &info, tt::DotOp dot) {
+    if (!loadToInfo.count(info.use)) {
+      llvm::outs() << *load << " is not an indirect load";
+      return false;
+    }
+
+    return (loadToInfo.lookup(info.use).use == dot);
+  };
+
+  auto duplicateIndirectLoad = [&](Operation *load) -> LogicalResult {
+    IRRewriter rewriter(dotOps[0]);
+    Value res = load->getResult(0);
+
+    bool extended = false;
+    SmallVector<Operation *> users = llvm::to_vector(res.getUsers());
+
+    Type resType = res.getType();
+    if (users.size() == 2) {
+      // directly used
+
+      // rewriter.setInsertionPoint(load);
+      // Operation *newLoad = rewriter.clone(load);
+      // Value newRes = newLoad->getResult();
+      // users[1]->replaceUsesOfWith(res, newRes);
+    } else if (users.size() == 1) {
+      auto extOp = dyn_cast<arith::ExtSIOp>(users.front());
+      if (!extOp)
+        return failure();
+
+      res = extOp.getResult();
+      resType = res.getType();
+      users = llvm::to_vector(res.getUsers());
+      if (users.size() != 2)
+        return failure();
+
+      extended = true;
+    }
+
+    rewriter.setInsertionPoint(load);
+    Value newRes = rewriter.clone(*load)->getResult(0);
+
+    if (extended) {
+      auto newExt =
+          rewriter.create<arith::ExtSIOp>(load->getLoc(), resType, newRes);
+      users[1]->replaceUsesOfWith(res, newExt);
+    } else {
+      users[1]->replaceUsesOfWith(res, newRes);
+    }
+
+    return success();
+  };
+
   for (auto [loadOp, info] : loadToInfo) {
     if (info.use == dotOps[0]) {
       schedule.insert(loadOp, STAGE_GLOBAL_LOAD_1,
@@ -946,10 +997,21 @@ scheduleLoads(std::array<tt::DotOp, 2> dotOps,
     } else if (info.use == dotOps[1]) {
       schedule.insert(loadOp, STAGE_GLOBAL_LOAD_2,
                       clusters[CLUSTER_GLOBAL_LOAD_2]);
-    } else if (loadToInfo.count(info.use)) {
-      // Indirect load
-      schedule.insert(loadOp, STAGE_GLOBAL_LOAD_1,
-                      clusters[CLUSTER_INDIRECT_LOAD]);
+    } else if (loadToInfo.count(info.use) &&
+               isa<IntegerType>(loadOp->getResult(0).getType())) {
+      // llvm::outs() << "Find indirect load\n";
+      // if (failed(duplicateIndirectLoad(loadOp))) {
+      //   llvm::outs() << "Failed to duplicate indirect load";
+      // }
+
+      // } else if (indirectUsedByDot(loadOp, info, dotOps[0])) {
+      //   // Indirect load
+      //   schedule.insert(loadOp, STAGE_GLOBAL_LOAD_1,
+      //                   clusters[CLUSTER_INDIRECT_LOAD_1]);
+      // } else if (indirectUsedByDot(loadOp, info, dotOps[1])) {
+      //   // Indirect load
+      //   schedule.insert(loadOp, STAGE_GLOBAL_LOAD_2,
+      //                   clusters[CLUSTER_INDIRECT_LOAD_2]);
     } else {
       LDBG(*loadOp << " will not be pipelined because it's not used by a dot");
     }
