@@ -2,9 +2,33 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 import torch
-from aiter.ops.triton.utils.arch_info import get_num_sms, get_fp8_dtypes
+# from aiter.ops.triton.utils.arch_info import get_num_sms, get_fp8_dtypes
 import math
+
+
+def get_arch():
+    return triton.runtime.driver.active.get_current_target().arch
+
+
+def get_fp8_dtypes():
+    if get_arch() in ("gfx950"):
+        e5m2_dtype = torch.float8_e5m2
+        e4m3_dtype = torch.float8_e4m3fn
+    else:
+        e5m2_dtype = torch.float8_e5m2fnuz
+        e4m3_dtype = torch.float8_e4m3fnuz
+
+    return e5m2_dtype, e4m3_dtype
+
+
+def get_num_sms():
+    # Returns the Compute Unit count of the current device
+    current_device_index = torch.cuda.current_device()
+    current_device = torch.cuda.get_device_properties(current_device_index)
+    num_sms = current_device.multi_processor_count
+    return num_sms
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
 float8_info = torch.finfo(e4m3_type)
@@ -54,6 +78,7 @@ def kernel_unified_attention_2d(
     value_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
     sink_ptr,  # [num_query_heads]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
+    block_tables_ptr_1,  # [num_seqs, max_num_blocks_per_seq]
     seq_lens_ptr,  # [num_seqs]
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
@@ -216,20 +241,20 @@ def kernel_unified_attention_2d(
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
     # iterate through tiles
     for j in range(num_blocks_start, num_blocks):
-
-        physical_block_idx = tl.load(block_tables_ptr + block_table_offset + j)
+        physical_block_idx_k = tl.load(block_tables_ptr + block_table_offset + j)
+        # physical_block_idx_v = tl.load(block_tables_ptr_1 + block_table_offset + j)
 
         offs_n = tl.arange(0, BLOCK_SIZE)
 
         v_offset = (
-            physical_block_idx * stride_v_cache_0
+            physical_block_idx_k * stride_v_cache_0
             + kv_head_idx * stride_v_cache_2
             + offs_d[None, :] * stride_v_cache_3
             + offs_n[:, None] * stride_v_cache_1
         )
 
         k_offset = (
-            physical_block_idx * stride_k_cache_0
+            physical_block_idx_k * stride_k_cache_0
             + kv_head_idx * stride_k_cache_2
             + offs_d[:, None] * stride_k_cache_3
             + offs_n[None, :] * stride_k_cache_1
@@ -313,13 +338,15 @@ def kernel_unified_attention_2d(
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
 
         # P : (BLOCK_M, BLOCK_SIZE)
-        P = tl.exp(S - m_j[:, None])
+        # P = tl.exp(S - m_j[:, None])
+        P = libdevice.fast_expf(S - m_j[:, None])
 
         # l_j : (BLOCK_M,)
         l_j = tl.sum(P, axis=1)
 
         # alpha : (BLOCK_M, )
-        alpha = tl.exp(M - m_j)
+        # alpha = tl.exp(M - m_j)
+        alpha = libdevice.fast_expf(M - m_j)
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc = acc * alpha[:, None]
@@ -819,6 +846,11 @@ def unified_attention(
             else:
                 BLOCK_M = 64
                 num_stages_2d = 1
+
+            BLOCK_M = 256
+            num_stages_2d = 4
+            num_warps = 8
+
             BLOCK_Q = BLOCK_M // num_queries_per_kv
             total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
 
@@ -826,6 +858,10 @@ def unified_attention(
             BLOCK_M = 256
             num_stages_2d = 4
             num_warps = 8
+
+            # BLOCK_M = 128
+            # num_stages_2d = 1
+            # num_warps = 4
             BLOCK_Q = BLOCK_M // num_queries_per_kv
             total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
         global runonce
@@ -844,6 +880,7 @@ def unified_attention(
             value_cache_ptr=v,
             sink_ptr=sinks,
             block_tables_ptr=block_table,
+            block_tables_ptr_1=block_table,
             seq_lens_ptr=seqused_k,
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
