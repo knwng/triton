@@ -2,7 +2,7 @@
 #include "TritonAMDGPUTransforms/MfmaGroup.h"
 #include "TritonAMDGPUTransforms/Passes.h"
 #include "TritonAMDGPUTransforms/WmmaGroup.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -11,15 +11,18 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/DecomposeScaledBlocked.h"
+#include "triton/Dialect/TritonGPU/Transforms/LayoutPropagationUtility.h"
 #include "triton/Tools/LayoutUtils.h"
+#include "triton/Tools/LinearLayout.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 using ::mlir::LLVM::AMD::isChainDotHead;
 using ::mlir::LLVM::AMD::isChainDotTail;
-using ::mlir::LLVM::AMD::scaleDotElemTypeToMLIRType;
-using mlir::triton::gpu::chooseScaledMfmaScaleLayout;
+
+#undef DEBUG_TYPE
+#define DEBUG_TYPE "tritonamd-accelerate-matmul"
 
 namespace mlir {
 
@@ -218,6 +221,8 @@ FailureOr<MfmaIntrinsic> chooseMfmaInstruction(tt::DotOp dot, int mfmaVersion,
 
 FailureOr<MfmaIntrinsic> chooseMfmaInstruction(tt::DotScaledOp dot,
                                                int mfmaVersion, int nonKDim) {
+  using ::mlir::LLVM::AMD::scaleDotElemTypeToMLIRType;
+
   auto ctx = dot.getContext();
   int64_t inputKDim = dot.getA().getType().getShape().back();
   if (dot.getAElemType() == ScaleDotElemType::E2M1 && dot.getLhsKPack()) {
@@ -897,6 +902,78 @@ public:
   }
 };
 
+// Figure out a best tilesPerWarp parameter that gives largest vector size for
+// global load for the given |scale| tensor feeding into dot_scaled op. Returns
+// the largest vector size and writes the choice to |result|.
+int deduceTilesPerWarp(TypedValue<RankedTensorType> scale, unsigned opIdx,
+                       unsigned nonKDim, ArrayRef<unsigned> warpsPerCTA,
+                       SmallVectorImpl<unsigned> *result) {
+  std::array<unsigned, 2> chosen{1, 1};
+  int vecSize = 1;
+  if (!scale) {
+    result->assign(chosen.begin(), chosen.end());
+    return vecSize;
+  }
+
+  Builder b(scale.getContext());
+  auto kReg = b.getStringAttr("register");
+
+  // Source code have flexibility to preshuffle scale tensor to achieve better
+  // global load vectorization. That preshuffle scheme is conveyed via some
+  // tl.reshape and tl.trans op combinations. Instead of hardcoding one case or
+  // pattern match the op chain here, we try certain scale tensor layouts and
+  // see which one gives us better vectorization when pushed upwards to the
+  // global load.
+  //
+  // For 16x16x128 scaled MFMA intrinsic, each thread only reads one i8 value.
+  // For better vectorization, we prefer to stick 2x2 such intrinsic together so
+  // each thread can read 4xi8 values.
+  SmallVector<std::array<unsigned, 2>, 2> choices{{2, 2}, {1, 1}};
+  for (const auto &choice : choices) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "choice: [" << choice[0] << ", " << choice[1] << "]\n");
+    LinearLayout layout = ttg::chooseScaledMfmaScaleLayout(
+        scale.getContext(), opIdx, scale.getType().getShape(), nonKDim, choice,
+        warpsPerCTA);
+    LLVM_DEBUG(llvm::dbgs() << "current scale layout: " << layout << "\n");
+
+    // Infer source layout used for global load using the current scale layout.
+    auto loadLayoutPair =
+        ttg::inferSourceLoadLayout(layout, scale.getDefiningOp());
+    if (!loadLayoutPair)
+      continue;
+    tt::LoadOp loadOp = loadLayoutPair->first;
+    const LinearLayout &srcLayout = loadLayoutPair->second;
+    LLVM_DEBUG(llvm::dbgs() << "inferred src layout: " << srcLayout << "\n");
+    unsigned fastDim =
+        ttg::getOrder(cast<RankedTensorType>(loadOp.getType()))[0];
+    auto outDim = llvm::to_vector(srcLayout.getOutDimNames())[fastDim];
+    LLVM_DEBUG(llvm::dbgs() << "fastest out dim: " << outDim << "\n");
+
+    // Figure out the largest vector size.
+    LinearLayout tile, quot;
+    const int maxVecElems = 128 / 8; // Each scale value is 8 bit.
+    for (int v = maxVecElems; v > vecSize; v /= 2) {
+      tile = LinearLayout::identity1D(v, kReg, outDim);
+      std::optional<ColumnAction> perm =
+          regPermForDivide(srcLayout, tile, /*left=*/true);
+      if (!perm) {
+        LLVM_DEBUG(llvm::dbgs() << "cannot regPermForDivide\n");
+        continue;
+      }
+      auto newLayout = perm->apply(srcLayout);
+      if (divideLeft(newLayout, tile)) {
+        LLVM_DEBUG(llvm::dbgs() << "found vector size: " << v << "\n");
+        chosen = choice;
+        vecSize = v;
+        break;
+      }
+    }
+  }
+  result->assign(chosen.begin(), chosen.end());
+  return vecSize;
+}
+
 class DecomposeAMDScaledBlocked final : public ttg::DecomposeScaledBlocked {
 public:
   DecomposeAMDScaledBlocked(MLIRContext *context, PatternBenefit benefit = 1)
@@ -1035,34 +1112,18 @@ public:
     auto warpsPerTile =
         warpsPerTileMFMA(dotOp, oldShape, numWarps, {mDim, nDim});
 
-    // For scale tensor preshuffling, the minimum block size is 32x32x256.
-    // When using MFMA16 instructions, each warp should compute two MFMA ops
-    // along the non-K dimension. To support this, we must set tilesPerWarp to
-    // {2, 2}. Failing to do so won't break correctness, but it will prevent
-    // vectorized local_loads, as the data each thread needs won't be contiguous
-    // due to the shuffle pattern. This requirement doesn’t apply to MFMA32
-    // instructions, since only one MFMA op spans the non-K dimension at the
-    // minimal shuffling size.
-    SmallVector<unsigned> tilesPerWarp = getTilesPerWarp(aScale, bScale);
-
-    if (rank == 3) {
-      tilesPerWarp.insert(tilesPerWarp.begin(), 1);
-    }
+    SmallVector<unsigned, 2> tilesA{1, 1}, tilesB{1, 1}, tilesPerWarp;
+    int vecA = deduceTilesPerWarp(aScale, 0, mDim, warpsPerTile, &tilesA);
+    int vecB = deduceTilesPerWarp(bScale, 1, mDim, warpsPerTile, &tilesB);
+    tilesPerWarp = vecA > vecB ? tilesA : tilesB;
+    LLVM_DEBUG(llvm::dbgs() << "chosen tilesPerWarp: [" << tilesPerWarp[0]
+                            << ", " << tilesPerWarp[1] << "]\n");
 
     // Always use transposed mfma layout. This enables larger vectorization
     // for global store instructions.
-    mlir::Attribute mfmaEnc;
-    if (llvm::any_of(tilesPerWarp, [](int x) { return x != 1; })) {
-      mfmaEnc = ttg::AMDMfmaEncodingAttr::get(
-          ctx, /*verison=*/mfmaVersion, warpsPerTile, tilesPerWarp,
-          /*instrShape=*/mDim, nDim, /*isTransposed=*/true, ctaLayout,
-          oldRetType.getElementType());
-    } else {
-      mfmaEnc = ttg::AMDMfmaEncodingAttr::get(
-          ctx, /*verison=*/mfmaVersion, warpsPerTile,
-          /*instrShape=*/mDim, nDim, /*isTransposed=*/true, ctaLayout,
-          oldRetType.getElementType());
-    }
+    mlir::Attribute mfmaEnc = ttg::AMDMfmaEncodingAttr::get(
+        ctx, /*verison=*/mfmaVersion, warpsPerTile, tilesPerWarp, mDim, nDim,
+        /*isTransposed=*/true, ctaLayout, oldRetType.getElementType());
 
     auto newRetType =
         RankedTensorType::get(oldShape, oldRetType.getElementType(), mfmaEnc);
@@ -1164,7 +1225,7 @@ public:
         shape = llvm::to_vector(scale.getType().getShape());
       }
 
-      LinearLayout newLL = chooseScaledMfmaScaleLayout(
+      LinearLayout newLL = ttg::chooseScaledMfmaScaleLayout(
           ctx, idx, shape, mDim, tilesPerWarp, warpsPerTile);
 
       Attribute newScaleEncoding = ttg::LinearEncodingAttr::get(ctx, newLL);
@@ -1284,7 +1345,8 @@ FailureOr<WmmaIntrinsic> chooseWmmaInstruction(Location loc, int wmmaVersion,
       wmmaVersion, mDim, nDim, inputKSize, aElemType, bElemType, cElemType);
   if (failed(maybeWmmaIntrinsic))
     return emitError(loc, "no matching matrix core intrinsic due to "
-                          "unsupported element type");
+                          "unsupported element type: A=")
+           << aElemType << " B=" << bElemType << " C=" << cElemType;
 
   kDim = maybeWmmaIntrinsic->kDim;
   assert(kDim != 0);
@@ -1365,7 +1427,8 @@ public:
     // store instructions.
     bool isTransposed = true;
     wmmaEnc = ttg::AMDWmmaEncodingAttr::get(ctx, wmmaVersion, isTransposed,
-                                            warpsPerTile, CTALayout);
+                                            warpsPerTile, CTALayout,
+                                            {mDim, nDim, kDim});
 
     auto newRetType = RankedTensorType::get(retShape, operandTypes[3], wmmaEnc);
 
@@ -1580,7 +1643,6 @@ struct TritonAMDGPUAccelerateMatmulPass
   using Base::Base;
 
   void runOnOperation() override {
-
     MLIRContext *context = &getContext();
     ModuleOp m = getOperation();
 
