@@ -467,9 +467,18 @@ template <typename Op> Op getDefOpBeforeConvertLayout(Value op) {
   return op.getDefiningOp<Op>();
 }
 
-bool hasShuffledDotScale(Value v, int opIdx) {
-  if (!v)
-    return false;
+// Figure out a best tilesPerWarp parameter that gives largest vector size for
+// global load for the given |scale| tensor feeding into dot_scaled op. Returns
+// the largest vector size and writes the choice to |result|.
+int deduceTilesPerWarp(TypedValue<RankedTensorType> v, unsigned opIdx,
+                       unsigned nonKDim, ArrayRef<unsigned> warpsPerCTA,
+                       SmallVectorImpl<unsigned> *result) {
+  std::array<unsigned, 2> chosen{1, 1};
+  int vecSize = 1;
+  if (!v) {
+    result->assign(chosen.begin(), chosen.end());
+    return vecSize;
+  }
 
   while (auto cvtOp = v.getDefiningOp<ttg::ConvertLayoutOp>()) {
     v = cvtOp.getSrc();
@@ -487,49 +496,71 @@ bool hasShuffledDotScale(Value v, int opIdx) {
   if (!scale)
     return false;
 
-  auto shape = cast<RankedTensorType>(scale.getType()).getShape();
+  Builder b(scale.getContext());
+  auto kReg = b.getStringAttr("register");
 
-  int rank = shape.size();
-  int blockNonK = shape[rank - 2];
-  // 1 scale always scales 32 elements along K dim
-  int blockK = shape[rank - 1] * 32;
+  // Source code have flexibility to preshuffle scale tensor to achieve better
+  // global load vectorization. That preshuffle scheme is conveyed via some
+  // tl.reshape and tl.trans op combinations. Instead of hardcoding one case or
+  // pattern match the op chain here, we try certain scale tensor layouts and
+  // see which one gives us better vectorization when pushed upwards to the
+  // global load.
+  //
+  // For 16x16x128 scaled MFMA intrinsic, each thread only reads one i8 value.
+  // For better vectorization, we prefer to stick 2x2 such intrinsic together so
+  // each thread can read 4xi8 values.
+  SmallVector<std::array<unsigned, 2>, 2> choices{{2, 2}, {1, 1}};
+  for (const auto &choice : choices) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "choice: [" << choice[0] << ", " << choice[1] << "]\n");
+    LinearLayout layout = ttg::chooseScaledMfmaScaleLayout(
+        scale.getContext(), opIdx,
+        cast<RankedTensorType>(scale.getType()).getShape(), nonKDim, choice,
+        warpsPerCTA);
+    LLVM_DEBUG(llvm::dbgs() << "current scale layout: " << layout << "\n");
 
-  auto reshapeOp2D = getDefOpBeforeConvertLayout<triton::ReshapeOp>(scale);
-  if (!reshapeOp2D || reshapeOp2D.getType().getShape() != shape) {
-    return false;
+    // Infer source layout used for global load using the current scale layout.
+    auto loadLayoutPair =
+        ttg::inferSourceLoadLayout(layout, scale.getDefiningOp());
+    if (!loadLayoutPair)
+      continue;
+    tt::LoadOp loadOp = loadLayoutPair->first;
+    const LinearLayout &srcLayout = loadLayoutPair->second;
+    LLVM_DEBUG(llvm::dbgs() << "inferred src layout: " << srcLayout << "\n");
+    unsigned fastDim =
+        ttg::getOrder(cast<RankedTensorType>(loadOp.getType()))[0];
+    auto outDim = llvm::to_vector(srcLayout.getOutDimNames())[fastDim];
+    LLVM_DEBUG(llvm::dbgs() << "fastest out dim: " << outDim << "\n");
+
+    // Figure out the largest vector size.
+    LinearLayout tile, quot;
+    const int maxVecElems = 128 / 8; // Each scale value is 8 bit.
+    for (int v = maxVecElems; v > vecSize; v /= 2) {
+      tile = LinearLayout::identity1D(v, kReg, outDim);
+      std::optional<ColumnAction> perm =
+          regPermForDivide(srcLayout, tile, /*left=*/true);
+      if (!perm) {
+        LLVM_DEBUG(llvm::dbgs() << "cannot regPermForDivide\n");
+        continue;
+      }
+      auto newLayout = perm->apply(srcLayout);
+      if (divideLeft(newLayout, tile)) {
+        LLVM_DEBUG(llvm::dbgs() << "found vector size: " << v << "\n");
+        chosen = choice;
+        vecSize = v;
+        break;
+      }
+    }
   }
-
-  const std::array<int, 7> transposeOrder{0, 5, 3, 1, 4, 2, 6};
-  auto transOp =
-      getDefOpBeforeConvertLayout<triton::TransOp>(reshapeOp2D.getSrc());
-  if (!transOp || transOp.getOrder() != ArrayRef<int>(transposeOrder)) {
-    return false;
-  }
-
-  const std::array<int64_t, 7> reshape7DShape{
-      blockNonK / 32, blockK / 32 / 8, 4, 16, 2, 2, 1};
-  auto reshapeOp7D =
-      getDefOpBeforeConvertLayout<triton::ReshapeOp>(transOp.getSrc());
-
-  if (!reshapeOp7D ||
-      reshapeOp7D.getType().getShape() != ArrayRef<int64_t>(reshape7DShape)) {
-    return false;
-  }
-
-  return true;
-}
-
-SmallVector<unsigned, 2> getTilesPerWarp(Value opA, Value opB) {
-  if (hasShuffledDotScale(opA, 0) || hasShuffledDotScale(opB, 1)) {
-    return {2, 2};
-  }
-  return {1, 1};
+  result->assign(chosen.begin(), chosen.end());
+  return vecSize;
 }
 
 class BlockedToMFMA : public OpRewritePattern<tt::DotOp> {
   int mfmaVersion;
   int nonKDim;
   int kPack;
+  using TensorValue = TypedValue<RankedTensorType>;
 
 public:
   BlockedToMFMA(MLIRContext *context, int mfmaVersion, int nonKDim, int kPack,
@@ -606,8 +637,15 @@ public:
     auto is16BitElemTy = (aElemTy.isF16() || aElemTy.isBF16());
 
     unsigned rank = oldRetType.getRank();
-    SmallVector<unsigned, 2> tilesPerWarp =
-        getTilesPerWarp(dotOp.getA(), dotOp.getB());
+
+    SmallVector<unsigned, 2> tilesA{1, 1}, tilesB{1, 1}, tilesPerWarp;
+    int vecA = deduceTilesPerWarp(cast<TensorValue>(a), 0, mDim, warpsPerTile,
+                                  &tilesA);
+    int vecB = deduceTilesPerWarp(cast<TensorValue>(b), 1, mDim, warpsPerTile,
+                                  &tilesB);
+    tilesPerWarp = vecA > vecB ? tilesA : tilesB;
+    LLVM_DEBUG(llvm::dbgs() << "chosen tilesPerWarp: [" << tilesPerWarp[0]
+                            << ", " << tilesPerWarp[1] << "]\n");
 
     bool hasPreShuffledScale = (tilesPerWarp[0] > 1 && tilesPerWarp[1] > 1);
 
@@ -901,78 +939,6 @@ public:
     return success();
   }
 };
-
-// Figure out a best tilesPerWarp parameter that gives largest vector size for
-// global load for the given |scale| tensor feeding into dot_scaled op. Returns
-// the largest vector size and writes the choice to |result|.
-int deduceTilesPerWarp(TypedValue<RankedTensorType> scale, unsigned opIdx,
-                       unsigned nonKDim, ArrayRef<unsigned> warpsPerCTA,
-                       SmallVectorImpl<unsigned> *result) {
-  std::array<unsigned, 2> chosen{1, 1};
-  int vecSize = 1;
-  if (!scale) {
-    result->assign(chosen.begin(), chosen.end());
-    return vecSize;
-  }
-
-  Builder b(scale.getContext());
-  auto kReg = b.getStringAttr("register");
-
-  // Source code have flexibility to preshuffle scale tensor to achieve better
-  // global load vectorization. That preshuffle scheme is conveyed via some
-  // tl.reshape and tl.trans op combinations. Instead of hardcoding one case or
-  // pattern match the op chain here, we try certain scale tensor layouts and
-  // see which one gives us better vectorization when pushed upwards to the
-  // global load.
-  //
-  // For 16x16x128 scaled MFMA intrinsic, each thread only reads one i8 value.
-  // For better vectorization, we prefer to stick 2x2 such intrinsic together so
-  // each thread can read 4xi8 values.
-  SmallVector<std::array<unsigned, 2>, 2> choices{{2, 2}, {1, 1}};
-  for (const auto &choice : choices) {
-    LLVM_DEBUG(llvm::dbgs()
-               << "choice: [" << choice[0] << ", " << choice[1] << "]\n");
-    LinearLayout layout = ttg::chooseScaledMfmaScaleLayout(
-        scale.getContext(), opIdx, scale.getType().getShape(), nonKDim, choice,
-        warpsPerCTA);
-    LLVM_DEBUG(llvm::dbgs() << "current scale layout: " << layout << "\n");
-
-    // Infer source layout used for global load using the current scale layout.
-    auto loadLayoutPair =
-        ttg::inferSourceLoadLayout(layout, scale.getDefiningOp());
-    if (!loadLayoutPair)
-      continue;
-    tt::LoadOp loadOp = loadLayoutPair->first;
-    const LinearLayout &srcLayout = loadLayoutPair->second;
-    LLVM_DEBUG(llvm::dbgs() << "inferred src layout: " << srcLayout << "\n");
-    unsigned fastDim =
-        ttg::getOrder(cast<RankedTensorType>(loadOp.getType()))[0];
-    auto outDim = llvm::to_vector(srcLayout.getOutDimNames())[fastDim];
-    LLVM_DEBUG(llvm::dbgs() << "fastest out dim: " << outDim << "\n");
-
-    // Figure out the largest vector size.
-    LinearLayout tile, quot;
-    const int maxVecElems = 128 / 8; // Each scale value is 8 bit.
-    for (int v = maxVecElems; v > vecSize; v /= 2) {
-      tile = LinearLayout::identity1D(v, kReg, outDim);
-      std::optional<ColumnAction> perm =
-          regPermForDivide(srcLayout, tile, /*left=*/true);
-      if (!perm) {
-        LLVM_DEBUG(llvm::dbgs() << "cannot regPermForDivide\n");
-        continue;
-      }
-      auto newLayout = perm->apply(srcLayout);
-      if (divideLeft(newLayout, tile)) {
-        LLVM_DEBUG(llvm::dbgs() << "found vector size: " << v << "\n");
-        chosen = choice;
-        vecSize = v;
-        break;
-      }
-    }
-  }
-  result->assign(chosen.begin(), chosen.end());
-  return vecSize;
-}
 
 class DecomposeAMDScaledBlocked final : public ttg::DecomposeScaledBlocked {
 public:
