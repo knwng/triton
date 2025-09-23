@@ -183,12 +183,23 @@ StreamCopyChainOps createStreamCopy(tt::LoadOp loadOp, Value alloc,
   return {newLoadOp, viewLoad, storeOp, maybeLocalLoad};
 }
 
+bool isUsedInDecomposition(Value v) {
+  SmallVector<Operation *> users = llvm::to_vector(v.getUsers());
+  if (users.size() != 2)
+    return false;
+
+  return (isa<arith::CmpIOp>(users[0]) && isa<arith::ExtUIOp>(users[1])) ||
+         (isa<arith::CmpIOp>(users[1]) && isa<arith::ExtUIOp>(users[0]));
+}
+
 // Returns the given |inputValue|'s dot user result encoding and updates |opIdx|
 // and |vecSize| with which dot operand |inputValue| is fed into if possible.
 ttg::AMDMfmaEncodingAttr getDotEncoding(Value inputValue, unsigned *opIdx,
                                         unsigned *vecSize) {
-  if (!inputValue.hasOneUse())
+  // if (!(inputValue.hasOneUse() || isUsedInDecomposition(inputValue))) {
+  if (!inputValue.hasOneUse()) {
     return nullptr;
+  }
 
   Operation *user = *inputValue.getUsers().begin();
   if (user->getNumResults() != 1 ||
@@ -206,6 +217,28 @@ ttg::AMDMfmaEncodingAttr getDotEncoding(Value inputValue, unsigned *opIdx,
   }
 
   return getDotEncoding(user->getResult(0), opIdx, vecSize);
+}
+
+static bool isScaleUsedByScaledUpcast(Value v) {
+  SmallVector<Value> worklist{v};
+  DenseSet<Value> seen;
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    for (OpOperand &use : v.getUses()) {
+      auto op = use.getOwner();
+      if (isa<tt::amdgpu::ScaledUpcastFp4Op, tt::amdgpu::ScaledUpcastFp8Op>(
+              op)) {
+        return (use.getOperandNumber() == 1);
+      }
+      for (Value res : op->getResults()) {
+        worklist.push_back(res);
+      }
+    }
+  }
+
+  return false;
 }
 
 // Adapted from
@@ -281,7 +314,23 @@ getSharedEncIfAllUsersAreDotEnc(Value loadedValue) {
           LDBG("Deduced shared encoding candidate from mfma layout: "
                << tempAttr);
           sharedEncs.push_back(tempAttr);
+        } else if (isScaleUsedByScaledUpcast(userResult)) {
+          // Disable swizzling for scales
+          auto attr = ttg::SwizzledSharedEncodingAttr::get(
+              loadedValue.getContext(), 1, 1, 1, sharedOrder, ctaLayout);
+          LDBG("Deduced shared encoding candidate for scale in scaled dot "
+               "decomposition: "
+               << attr);
+          sharedEncs.push_back(attr);
         }
+      } else if (isa<ttg::SliceEncodingAttr>(userResEnc) &&
+                 isScaleUsedByScaledUpcast(userResult)) {
+        auto attr = ttg::SwizzledSharedEncodingAttr::get(
+            loadedValue.getContext(), 1, 1, 1, sharedOrder, ctaLayout);
+        LDBG("Deduced shared encoding candidate for scale in scaled dot "
+             "decomposition based on slice: "
+             << attr);
+        sharedEncs.push_back(attr);
       }
     }
   }
@@ -605,6 +654,8 @@ preprocessLoop(triton::AMD::ModuleAxisInfoAnalysis &axisInfoAnalysis,
       LDBG("    used by op: " << *i.second);
     }
   });
+
+  // llvm::errs() << "forOp in pipeliner: " << forOp << "\n";
 
   LoadToInfoMap loadToInfo;
   for (const auto &[load, info] : loadOpToIndLevel) {
