@@ -15,7 +15,8 @@ from bench_utils import quantize_weight
 import tempfile
 
 
-def bench_mlp(batch_per_expt, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP):
+# def bench_mlp(batch_per_expt, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP):
+def bench_mlp(batch_per_expt, dim1, dim2, dim3, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP):
     assert n_expts_tot % EP == 0
     assert dim2 % TP == 0
     rank, world_size = triton_dist.setup()
@@ -29,12 +30,15 @@ def bench_mlp(batch_per_expt, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_d
     # -- init data --
     # weights
     wg = triton_dist.broadcast(torch.randn((dim1, n_expts_tot), device=dev))
+    # wg = torch.randn((dim1, n_expts_tot), device=dev)
     w1 = torch.randn((n_expts_tot // EP, dim1, dim2 // TP), device=dev)
-    w2 = torch.randn((n_expts_tot // EP, dim2 // TP // 2, dim1), device=dev)
+    # w2 = torch.randn((n_expts_tot // EP, dim2 // TP // 2, dim1), device=dev)
+    w2 = torch.randn((n_expts_tot // EP, dim2 // TP // 2, dim3), device=dev)
     # biases
     bg = triton_dist.broadcast(torch.randn((n_expts_tot, ), device=dev))
     b1 = torch.randn((n_expts_tot // EP, dim2 // TP), device=dev)
-    b2 = torch.randn((n_expts_tot // EP, dim1), device=dev)
+    # b2 = torch.randn((n_expts_tot // EP, dim1), device=dev)
+    b2 = torch.randn((n_expts_tot // EP, dim3), device=dev)
     ep_indx = (rank // TP) % EP
     groups = [list(range(ep * TP, (ep + 1) * TP)) for ep in range(EP)]
     b2 = triton_dist.broadcast(b2, src=ep_indx * TP, groups=groups, group_idx=ep_indx)
@@ -88,14 +92,17 @@ def bench_mlp(batch_per_expt, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_d
                            precision_config=pc2)
         x = triton_dist.reduce_scatter(x, metadata=metadata, dim=0)
     proton.finalize()
-    return roofline.parse_profile(fpath.with_suffix(".hatchet"), useful_op_regex=".*matmul.*")
+    # return roofline.parse_profile(fpath.with_suffix(".hatchet"), useful_op_regex=".*matmul.*")
+    return roofline.parse_profile(fpath.with_suffix(".hatchet"), useful_op_regex=".*matmul.*swiglu*")
 
 
-def roofline_mlp(batch_sizes, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP, \
-                  name="", verbose=True):
+# def roofline_mlp(batch_sizes, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP, \
+#                   name="", verbose=True):
+def roofline_mlp(batch_sizes, dim1, dim2, dim3, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP=1, EP=1, name="",
+                 verbose=True):
     out_path = Path(f"logs/{name}/{x_dtype}x-{w_dtype}w-TP{TP}-EP{EP}/")
     out_path.mkdir(parents=True, exist_ok=True)
-    csv_path = roofline.compute_roofline(dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP,  # fixed args
+    csv_path = roofline.compute_roofline(dim1, dim2, dim3, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, EP,  # fixed args
                                          bench_fn=bench_mlp,  # function to benchmark
                                          intensity_proxy_name="batch_per_expt",  # intensity proxy name
                                          intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
@@ -146,15 +153,25 @@ if __name__ == "__main__":
                          name="gpt-oss-x2")
         triton_dist.cleanup()
     else:
-        roofline_mlp(batch_sizes_dense, 8192, 8192, 1, 1, quantized_dtypes[0], quantized_dtypes[1], TP=1, EP=1,
-                     name="dense")
-        roofline_mlp(batch_sizes_moe, 5760, 5760, 128, 4, dense_dtypes[0], dense_dtypes[1], TP=1, EP=1,
-                     name="gpt-oss-x2")
-        roofline_mlp(batch_sizes_moe, 5760, 5760, 128, 4, quantized_dtypes[0], quantized_dtypes[1], TP=1, EP=1,
-                     name="gpt-oss-x2")
-        roofline_mlp(batch_sizes_moe, 5760, 5760, 128, 4, quantized_dtypes[0], quantized_dtypes[1], TP=2, EP=1,
-                     name="gpt-oss-x2")
-        roofline_mlp(batch_sizes_moe, 5760, 5760, 128, 4, quantized_dtypes[0], quantized_dtypes[1], TP=4, EP=1,
-                     name="gpt-oss-x2")
-        roofline_mlp(batch_sizes_moe, 5760, 5760, 128, 4, quantized_dtypes[0], quantized_dtypes[1], TP=8, EP=1,
-                     name="gpt-oss-x2")
+        # roofline_mlp(batch_sizes_dense, 8192, 8192, 1, 1, quantized_dtypes[0], quantized_dtypes[1], TP=1, EP=1,
+        #              name="dense")
+        # roofline_mlp(batch_sizes_moe, 5760, 5760, 128, 4, dense_dtypes[0], dense_dtypes[1], TP=1, EP=1,
+        #              name="gpt-oss-x2")
+        # roofline_mlp(batch_sizes_moe, 5760, 5760, 128, 4, quantized_dtypes[0], quantized_dtypes[1], TP=1, EP=1,
+        #              name="gpt-oss-x2")
+        # roofline_mlp(batch_sizes_moe, 5760, 5760, 128, 4, quantized_dtypes[0], quantized_dtypes[1], TP=2, EP=1,
+        #              name="gpt-oss-x2")
+        # roofline_mlp(batch_sizes_moe, 5760, 5760, 128, 4, quantized_dtypes[0], quantized_dtypes[1], TP=4, EP=1,
+        #              name="gpt-oss-x2")
+        # roofline_mlp(batch_sizes_moe, 5760, 5760, 128, 4, quantized_dtypes[0], quantized_dtypes[1], TP=8, EP=1,
+        #              name="gpt-oss-x2")
+
+        batch_ranges_moe = [(1, 2, 1), (2, 5, 2), (8, 18, 8), (32, 65, 32), (128, 257, 128), (1024, 4100, 1024),
+                            (8192, 8200, 32)]
+        # batch_ranges_moe = [(8192, 8200, 32)]
+        # batch_ranges_moe = [(4, 5, 2)]
+        from functools import reduce
+        batch_ranges_moe = list(reduce(lambda x, y: x+y, [list(range(*x)) for x in batch_ranges_moe]))
+        print(f'{batch_ranges_moe=}')
+        quantized_dtypes = ["bf16", "mx4"]
+        roofline_mlp(batch_ranges_moe, 3072, 6144, 3072, 128, 4, *quantized_dtypes, TP=1, EP=1, name="oai-gpt-oss")
