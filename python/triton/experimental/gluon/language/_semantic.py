@@ -207,7 +207,7 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         rhs = self.broadcast_impl_shape(rhs, ret_shape)
         return lhs, rhs
 
-    def arange(self, start, end, layout):
+    def arange(self, start, end, layout=None):
         shape = [end - start]
         if layout is None:
             layout = AutoLayout()
