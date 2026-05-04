@@ -16,6 +16,8 @@ from triton_kernels.numerics_details.flexpoint import (
 from triton_kernels.numerics_details.mxfp_details._downcast_to_mxfp import MXFP_BLOCK_SIZE, NVFP_BLOCK_SIZE
 from triton_kernels.tensor_details.layout_details.hopper_scale import unswizzle_mxfp4_scale_hopper
 from triton_kernels.tensor_details.layout_details.hopper_value import mxfp4_to_bf16_triton
+from triton_kernels.tensor_details.layout_details.cdna4_scale import unswizzle_mx_scale_cdna4
+from triton_kernels.tensor_details.layout_details.gfx1250_scale import unswizzle_mx_scale_gfx1250
 from ._common import (
     compute_offsets,
     get_scaled_dot_format_string,
@@ -105,6 +107,8 @@ def _p_matmul(
              NUM_SMS: tl.constexpr,
              X_TMA_MODE: tl.constexpr,
              Y_TMA_MODE: tl.constexpr,
+             W_TMA_MODE: tl.constexpr = "dense",
+             W_SCALE_TMA: tl.constexpr = True,
              TOKENS_PER_EXPT_FOR_ANNOTATION=None,
              UPCAST_INDICES: tl.constexpr=False,
              SWAP_XW: tl.constexpr = False,
@@ -169,6 +173,9 @@ def _p_matmul(
             PACKED_BLOCK_K_W: tl.constexpr = BLOCK_K
             PACKED_BLOCK_N_W: tl.constexpr = BLOCK_N // W_K_DIVISOR
     else:
+        W_K_DIVISOR: tl.constexpr = 1
+        W_K_MULTIPLIER: tl.constexpr = 1
+        W_N_DIVISOR: tl.constexpr = 1
         PACKED_BLOCK_K_W: tl.constexpr = BLOCK_K
         PACKED_BLOCK_N_W: tl.constexpr = BLOCK_N
         tl.static_assert(SWIZZLE_MX_SCALE == "STRIDED")
@@ -231,12 +238,15 @@ def _p_matmul(
 
     DISALLOW_ACC_MULTI_BUFFER: tl.constexpr = is_w_microscaled and BLOCK_M * BLOCK_N >= 128 * 256
 
+    # warp_specialize and loop flattening are CUDA-only optimizations; disable on AMD/non-CUDA paths.
+    USE_FLATTEN_LOOPS: tl.constexpr = FLATTEN_LOOPS and (W_TMA_MODE is not None)
+    USE_WARP_SPECIALIZE: tl.constexpr = USE_FLATTEN_LOOPS
     for block_id in tl.range(
         tl.program_id(0), num_blocks, NUM_SMS,
-        flatten=FLATTEN_LOOPS,
+        flatten=USE_FLATTEN_LOOPS,
         disallow_acc_multi_buffer=DISALLOW_ACC_MULTI_BUFFER,
         # Workaround for compile error in hopper warp specialization
-        warp_specialize=FLATTEN_LOOPS,
+        warp_specialize=USE_WARP_SPECIALIZE,
     ):
 
         pid_z, pid_m, pid_n, pid_k = compute_pids(block_id, useful_grid_m, grid_n, num_blocks, XCD_SWIZZLE, GROUP_M, SPLIT_K)
@@ -280,6 +290,8 @@ def _p_matmul(
             if GatherIndx is not None:
                 tl.static_assert(HAS_GATHER)
                 offs_m = tl.load(GatherIndx + slice_off_m.to(index_type) + offs_m)
+            else:
+                XBase += slice_off_m.to(index_type) * stride_x_m
             offs_x_m = offs_m.to(index_type)[:, None] * stride_x_m
             offs_x_k = (off_k_x0.to(index_type) // block_div + tl.arange(0, BLOCK_K // block_div))[None, :] * stride_x_k
 
@@ -294,6 +306,52 @@ def _p_matmul(
             XMxScalePtrs += offs_k_scale.to(index_type)[None, :] * stride_x_mx_k
 
         acc = tl.zeros((BLOCK_N, BLOCK_M) if SWAP_XW else (BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        # ---- pointer setup for non-TMA W / W scale paths ----
+        # Compute the upper K-bound for non-TMA W loads.
+        # For K-ragged mode, W's per-slice K may not be aligned to BLOCK_K, so we
+        # need a per-slice bound (independent of X's potentially padded slice).
+        if RAGGED_DIMENSION == "K":
+            w_slice_size_raw = tl.load(WSliceSizes + pid_z)
+            if PACKED_BLOCK_K_W >= BLOCK_K:
+                w_slice_size_packed = w_slice_size_raw * (PACKED_BLOCK_K_W // BLOCK_K)
+            else:
+                w_slice_size_packed = w_slice_size_raw // (BLOCK_K // PACKED_BLOCK_K_W)
+            K_W_BOUND = off_k_w0 + w_slice_size_packed
+            # Similarly, X's per-slice bound (in unpacked K units).
+            x_slice_size_raw = tl.load(XSliceSizes + pid_z)
+            K_X_BOUND = off_k_x0 + x_slice_size_raw
+        else:
+            K_W_BOUND = K_W
+            K_X_BOUND = K
+        if W_TMA_MODE is None:
+            offs_w_n_arr = pid_n * PACKED_BLOCK_N_W + tl.arange(0, PACKED_BLOCK_N_W)
+            if SWIZZLE_MX_VALUE == "HOPPER_VALUE":
+                N_W_PADDED = tl.cdiv(N, 64) * 64
+            else:
+                N_W_PADDED = N
+            offs_w_n_arr = tl.max_contiguous(tl.multiple_of(offs_w_n_arr % (N_W_PADDED // W_N_DIVISOR), PACKED_BLOCK_N_W), PACKED_BLOCK_N_W)
+            offs_w_k_arr = off_k_w0.to(index_type) + tl.arange(0, PACKED_BLOCK_K_W)
+            WBase_local = W + off_w_z.to(index_type) * stride_w_e
+            WPtrs = WBase_local + offs_w_k_arr.to(index_type)[:, None] * stride_w_k + offs_w_n_arr.to(index_type)[None, :] * stride_w_n
+        if not W_SCALE_TMA and is_w_microscaled:
+            if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+                NON_K_PRESHUFFLE_BLOCK_SIZE: tl.constexpr = 32
+                PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K * NON_K_PRESHUFFLE_BLOCK_SIZE
+                SCALE_BLOCK_N_PER_TILE: tl.constexpr = BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE
+            elif SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+                NON_K_PRESHUFFLE_BLOCK_SIZE: tl.constexpr = 128
+                PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K * NON_K_PRESHUFFLE_BLOCK_SIZE
+                SCALE_BLOCK_N_PER_TILE: tl.constexpr = BLOCK_N // NON_K_PRESHUFFLE_BLOCK_SIZE
+            else:
+                tl.static_assert(SWIZZLE_MX_SCALE == "STRIDED", "Unsupported W scale swizzle for non-TMA path")
+                PACKED_MX_BLOCK: tl.constexpr = MX_SCALE_BLOCK_K
+                SCALE_BLOCK_N_PER_TILE: tl.constexpr = BLOCK_N
+            offs_n_scale_arr = (pid_n * SCALE_BLOCK_N_PER_TILE + tl.arange(0, SCALE_BLOCK_N_PER_TILE)) % N
+            offs_n_scale_arr = tl.max_contiguous(tl.multiple_of(offs_n_scale_arr, SCALE_BLOCK_N_PER_TILE), SCALE_BLOCK_N_PER_TILE)
+            offs_k_scale_arr = off_k_w0 // PACKED_BLOCK_K_W * PACKED_MX_BLOCK + tl.arange(0, PACKED_MX_BLOCK)
+            WMxScaleBase = WMxScale + off_w_z.to(index_type) * stride_w_mx_e
+            WMxScalePtrs_local = WMxScaleBase + offs_k_scale_arr.to(index_type)[None, :] * stride_w_mx_k + offs_n_scale_arr.to(index_type)[:, None] * stride_w_mx_n
 
         # ------------------------------------------------------------
         # inner loop
@@ -328,7 +386,7 @@ def _p_matmul(
                 tl.static_assert(X_TMA_MODE is None)
                 XPtrs = XBase + offs_x_m + offs_x_k
                 XBase += (BLOCK_K // block_div) * SPLIT_K * stride_x_k
-                mask_k = tl.arange(0, BLOCK_K // block_div) * block_div < K - off_k_x
+                mask_k = tl.arange(0, BLOCK_K // block_div) * block_div < K_X_BOUND - off_k_x
                 if EVEN_K:
                     if SPLIT_K > 1:
                         x = tl.load(XPtrs, mask=mask_k[None, :], other=0.0)
@@ -373,7 +431,16 @@ def _p_matmul(
                     x_scales = tl.full((BLOCK_M, BLOCK_K // MX_PACK_DIVISOR), 1.0, dtype=tl.float8e4nv)
 
             # --- load w ---
-            if W_SHUFFLED:
+            if W_TMA_MODE is None:
+                if EVEN_K and RAGGED_DIMENSION != "K":
+                    mask_k_w = tl.full([PACKED_BLOCK_K_W], True, dtype=tl.int1)
+                else:
+                    mask_k_w = (off_k_w + tl.arange(0, PACKED_BLOCK_K_W)) < K_W_BOUND
+                w = tl.load(WPtrs, mask=mask_k_w[:, None], other=0.0, cache_modifier=W_CACHE_MODIFIER)
+                if w.dtype == tl.float32 and ALLOW_TF32:
+                    w = round_f32_to_tf32(w)
+                WPtrs += (PACKED_BLOCK_K_W * SPLIT_K) * stride_w_k
+            elif W_SHUFFLED:
                 tile_k_idx = off_k_w // PACKED_BLOCK_K_W
                 tile_n_idx = off_n // BLOCK_N
                 w = tl.reshape(
@@ -390,7 +457,19 @@ def _p_matmul(
             if is_w_microscaled:
                 off_k_mx = off_k_w // (MX_PACK_DIVISOR // W_K_DIVISOR)
                 tl.static_assert(MX_PACK_DIVISOR % W_K_DIVISOR == 0)
-                if SWIZZLE_MX_SCALE == "BLACKWELL_SCALE":
+                if not W_SCALE_TMA:
+                    if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
+                        w_scales = unswizzle_mx_scale_cdna4(tl.load(WMxScalePtrs_local), BLOCK_N, MX_SCALE_BLOCK_K)
+                    elif SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+                        w_scales = unswizzle_mx_scale_gfx1250(tl.load(WMxScalePtrs_local), BLOCK_N, MX_SCALE_BLOCK_K)
+                    else:
+                        if EVEN_K and RAGGED_DIMENSION != "K":
+                            mask_k_scale = tl.full([MX_SCALE_BLOCK_K], True, dtype=tl.int1)
+                        else:
+                            mask_k_scale = offs_k_scale_arr * (MX_PACK_DIVISOR // W_K_DIVISOR) < K_W_BOUND
+                        w_scales = tl.load(WMxScalePtrs_local, mask=mask_k_scale[None, :], other=0.0)
+                    WMxScalePtrs_local += (PACKED_MX_BLOCK * SPLIT_K) * stride_w_mx_k
+                elif SWIZZLE_MX_SCALE == "BLACKWELL_SCALE":
                     flattened_expt_n_idx = off_w_z * ((N + 127) // 128) + (off_n // 128)
                     w_scales = WMxScale.load([0, flattened_expt_n_idx, off_k_mx // 4, 0, 0])
                     w_scales = w_scales.reshape((w_scales.shape[1], w_scales.shape[2] * w_scales.shape[-2] * w_scales.shape[-1]))
@@ -438,7 +517,7 @@ def _p_matmul(
             tile_id1 += NUM_SMS
             pid_s1, pid_m1, pid_n1, pid_k1 = compute_pids(tile_id1, useful_grid_m, grid_n, num_blocks, XCD_SWIZZLE, GROUP_M, SPLIT_K)
             expt_id1, _, start_z1, start_m1, _, off_m1, _, _ = compute_offsets(
-                pid_z, pid_m, pid_k,
+                pid_s1, pid_m1, pid_k1,
                 XBlockSchedule, XSliceOffs, XBlockOffs, X_SLICE_SIZES_DIVISIBILITY,
                 WBlockSchedule, WSliceOffs, W_SLICE_SIZES_DIVISIBILITY,
                 RAGGED_DIMENSION,

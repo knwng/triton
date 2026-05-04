@@ -388,6 +388,14 @@ def matmul(a, b, bias,
         # if ragged dimension is K, w must be either padded or row major to ensure alignment
         (ragged_dimension != "K" or b.stride(-1) == 1 or b_ragged_metadata.slice_sizes_divisibility is not None)
     )
+    # Persistent kernel can run without TMA (relies on regular pointer loads). On AMD,
+    # TMA is not available but we still want to be able to use the persistent kernel.
+    can_use_persistent = can_use_tma or (
+        not is_cuda() and
+        a.numel() > 0 and b.numel() > 0 and
+        (c is None or c.stride(-1) == 1) and
+        (c_acc_in is None or c_acc_is_c)
+    )
     if b_scale is not None and isinstance(b_scale.storage.layout, StridedLayout) and b_scale.storage.data.stride()[-1] != 1:
         # In this case, we need to transpose b_scale. Then the reduction dim
         # becomes the last dim that will be divided by 32. This to be a multiple
@@ -405,7 +413,7 @@ def matmul(a, b, bias,
         a_uses_tma_when_persistent = has_gather_tma or not has_gather
     opt_flags = make_opt_flags(out_dtype, a.dtype, b.dtype, precision_config,
         batch_size, M, N, b.shape[-2], a_ragged_metadata,
-        can_use_tma, can_use_split_k, epilogue.effective_itemsize,
+        can_use_persistent, can_use_split_k, epilogue.effective_itemsize,
         a_transpose, c_acc_in is not None,
         block_k = block_k,
         mx_block_size = mx_block_size,
@@ -431,7 +439,7 @@ def matmul(a, b, bias,
     if ragged_dimension == "K" and torch.cuda.get_device_capability()[0] < 9:
         opt_flags.num_stages = 1
     if ragged_dimension == "K":
-        a_has_tma = opt_flags.is_persistent and (a.stride(-1) != 1 or (a_ragged_metadata.slice_sizes_divisibility is not None))
+        a_has_tma = can_use_tma and opt_flags.is_persistent and (a.stride(-1) != 1 or (a_ragged_metadata.slice_sizes_divisibility is not None))
         # If TMA is used, limit is handled automatically, so we can pretend K is "even".
         # (For unpadded input, we assume that the first block_k unused rows are zero-filled,
         # when routing_data.expt_hist.sum() is less than K or K_W.)
@@ -442,7 +450,7 @@ def matmul(a, b, bias,
     else:
         batch_size = b.shape[0] if a_ragged_metadata is None and b.ndim == 3 else 1
         assert K == K_W
-        a_has_tma = opt_flags.is_persistent and (has_gather_tma or not has_gather)
+        a_has_tma = can_use_tma and opt_flags.is_persistent and (has_gather_tma or not has_gather)
         even_K = (K % opt_flags.block_k == 0)
     if b_scale is not None and b_scale.storage.layout.name != "STRIDED" and not opt_flags.is_persistent and target_info.has_native_mxfp():
         raise NotImplementedError("Must use persistent kernel and be TMA-compliant for native MXFP")
@@ -529,12 +537,12 @@ def matmul(a, b, bias,
     c_tma_mode = None if not c_has_tma else "ragged" if is_c_ragged and not has_scatter_tma else "dense"
     c_tensor_or_tma = make_tma(c, c_tma_block_size, c_tma_mode) if c_has_tma else c.storage.data
     # create tma descriptor for w
-    b_has_tma = opt_flags.is_persistent
+    b_has_tma = opt_flags.is_persistent and can_use_tma
     b_tensor_or_tma = make_tma(b, [1, opt_flags.block_k, opt_flags.block_n], "dense") if b_has_tma else b.storage.data
     if b_has_tma and precision_config.allow_tf32 and b.storage.data.dtype == torch.float32:
         b_tensor_or_tma.round_f32_to_tf32 = True
     # create tma descriptor for w_scale
-    b_scale_has_tma = opt_flags.is_persistent and b_scale is not None
+    b_scale_has_tma = opt_flags.is_persistent and can_use_tma and b_scale is not None
     b_transpose = b_is_shuffled or b.storage.data.stride()[-2] == 1
     if b_scale_has_tma:
         scale_block_k = opt_flags.block_k // mx_block_size
@@ -593,7 +601,14 @@ def matmul(a, b, bias,
         "n_reduce_shards": fused_comm.n_reduce_shards,
     } if fused_comm is not None else {}
     b_strides = b.storage.data.stride()[:3] if b_is_shuffled else b.storage.data.stride()
-    extra_kernel_kwargs = {"W_SHUFFLED": b_is_shuffled} if opt_flags.is_persistent else {}
+    if opt_flags.is_persistent:
+        extra_kernel_kwargs = {
+            "W_SHUFFLED": b_is_shuffled,
+            "W_TMA_MODE": "dense" if b_has_tma else None,
+            "W_SCALE_TMA": b_scale_has_tma,
+        }
+    else:
+        extra_kernel_kwargs = {}
     n_valid_slices = b_tensor_or_tma.shape[0] if ragged_dimension == "M" else n_slices
     (kernels._p_matmul if opt_flags.is_persistent else kernels._matmul)[(grid,)](
                    c_tensor_or_tma, c.storage.data, *out_matmul.stride(),
