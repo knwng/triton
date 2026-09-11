@@ -7,7 +7,9 @@
 #include "rocprofiler-sdk/callback_tracing.h"
 #include "rocprofiler-sdk/fwd.h"
 
+#include <atomic>
 #include <cstdint>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
@@ -73,6 +75,8 @@ public:
   void flushBuffersNoThrow();
   void warnIfInvalidInterval();
   void warnIfSourceLocationsUnavailable();
+  void setRawOutputPath(const std::string &path);
+  void setAggregationEnabled(bool enabled);
 
   void recordCodeObjectLoad(
       const rocprofiler_callback_tracing_code_object_load_data_t &load);
@@ -109,7 +113,7 @@ public:
   }
   void processBuffer(rocprofiler_record_header_t **headers, size_t numHeaders,
                      uint64_t dropCount);
-  void flushAccum();
+  void flushAccum(int64_t timestampOffsetNs);
 
 private:
   struct PCSamplingAccum {
@@ -141,6 +145,11 @@ private:
     std::string file;
     uint32_t line{0};
     std::string function;
+  };
+
+  struct PCInfo {
+    std::optional<SourceLocation> sourceLocation;
+    std::optional<std::string> instruction;
   };
 
   struct SourceLocationKey {
@@ -181,8 +190,11 @@ private:
 
   struct SamplingState {
     PCSamplingAccumMap accum;
-    // Code objects represented in accum, maintained to avoid scanning accum
-    // while holding the sampling lock.
+    // Raw-only mode still needs one source/instruction mapping for every
+    // sampled PC even though no aggregate metrics are retained.
+    std::unordered_set<PCSamplingKey, PCSamplingKeyHash> rawPCs;
+    // Code objects represented in accum or rawPCs, maintained to avoid
+    // scanning either container while holding the sampling lock.
     std::unordered_set<uint64_t> pendingCodeObjectIds;
     std::unordered_set<uint64_t> flushingCodeObjectIds;
   };
@@ -191,8 +203,7 @@ private:
     MetadataState();
     ~MetadataState();
 
-    std::map<SourceLocationKey, std::optional<SourceLocation>>
-        sourceLocationCache;
+    std::map<SourceLocationKey, PCInfo> pcInfoCache;
 #if PROTON_ROCPROFILER_SDK_HAS_PC_SAMPLING &&                                  \
     PROTON_ROCPROFILER_SDK_HAS_CODEOBJ_ADDRESS_TRANSLATE
     std::unique_ptr<
@@ -232,14 +243,15 @@ private:
                             const DataToEntryMap &dataToEntry,
                             bool needsKernelChild);
 
-  void accumulate(PCSamplingMetric::PCSamplingMetricKind stallKind,
-                  bool isStalled, uint64_t dispatchId, uint64_t codeObjectId,
-                  uint64_t pcOffset);
+  void recordSample(PCSamplingMetric::PCSamplingMetricKind stallKind,
+                    bool isStalled, uint64_t dispatchId, uint64_t codeObjectId,
+                    uint64_t pcOffset, bool retainRawPC);
+  void appendRawOutput(const std::string &records);
+  void appendRawClockInfo(int64_t timestampOffsetNs);
+  void flushRawOutput();
 
-  std::optional<SourceLocation>
-  resolveSourceLocationLocked(MetadataState &state, uint64_t codeObjectId,
-                              uint64_t pcOffset,
-                              const PCSamplingTarget &target);
+  PCInfo resolvePCInfoLocked(MetadataState &state, uint64_t codeObjectId,
+                             uint64_t pcOffset, const PCSamplingTarget &target);
   bool ensureSourceLocationDecoderLocked(MetadataState &state,
                                          uint64_t codeObjectId);
   void clearSourceLocationCacheLocked(MetadataState &state,
@@ -269,6 +281,18 @@ private:
       "Proton was built without rocprofiler-sdk PC sampling support"};
   rocprofiler_context_id_t pcSamplingContext{};
   std::vector<rocprofiler_buffer_id_t> pcSamplingBuffers;
+
+  // Raw output is optional because retaining one JSON record per hardware
+  // sample can be large and adds callback-thread I/O overhead. The stream is
+  // configured before sampling starts and serialized independently from the
+  // aggregation and source-attribution locks.
+  std::atomic<bool> rawOutputEnabled{false};
+  std::atomic<bool> aggregationEnabled{true};
+  std::mutex rawOutputMutex;
+  std::string rawOutputPath;
+  std::unique_ptr<std::ofstream> rawOutput;
+  bool rawOutputErrorEmitted{false};
+  bool rawClockInfoWritten{false};
 
   // A flush consumes dispatch targets, so concurrent flushes cannot process
   // independent snapshots safely.

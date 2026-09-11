@@ -4,23 +4,27 @@ Each test should invoke one or more GPU kernels and check the validity of their 
 """
 
 import inspect
+import json
 import os
 import pathlib
-
-import triton
-import triton.profiler as proton
-import torch
-import json
-import pytest
-from typing import NamedTuple
 import threading
 import time
+from typing import NamedTuple
 
+import pytest
+import torch
+import triton
 import triton.language as tl
+import triton.profiler as proton
 import triton.profiler.hooks.launch as proton_launch
-from triton.profiler.state import COMPUTE_METADATA_SCOPE_NAME
 import triton.profiler.viewer as viewer
-from triton._internal_testing import is_hip, is_cuda, is_blackwell
+from triton._internal_testing import is_blackwell, is_cuda, is_hip
+from triton.profiler._pcsampling import (
+    PCSamplingTraceConfig,
+    merge_pc_sampling_chrome_trace,
+    prepare_pc_sampling_trace,
+)
+from triton.profiler.state import COMPUTE_METADATA_SCOPE_NAME
 from triton.testing import cuda_graph_without_gc
 
 
@@ -953,6 +957,122 @@ def test_hook_multiple_threads(tmp_path: pathlib.Path, device: str):
     assert root[1]["metrics"]["count"] == 100
 
 
+def test_merge_pc_sampling_chrome_trace(tmp_path: pathlib.Path):
+    profile_base = tmp_path / "pc_sampling_trace"
+    native_mode, config = prepare_pc_sampling_trace(
+        str(profile_base),
+        "trace",
+        "rocprofiler",
+        "pcsampling:format=chrome_trace:counter_bin_us=10",
+    )
+    assert config == PCSamplingTraceConfig(
+        raw_path=profile_base.with_suffix(".pc_sampling.jsonl"),
+        trace_path=profile_base.with_suffix(".chrome_trace"),
+        counter_bin_us=10,
+    )
+    assert native_mode == f"pcsampling:raw_output={config.raw_path}:aggregate=false"
+
+    conventional_event = {
+        "name": "kernel",
+        "cat": "kernel",
+        "ph": "X",
+        "pid": 0,
+        "tid": 1,
+        "ts": 0,
+        "dur": 1,
+    }
+    config.trace_path.write_text(
+        json.dumps({
+            "displayTimeUnit": "us",
+            "baseTimeNanoseconds": 1100,
+            "traceEvents": [conventional_event],
+        }),
+        encoding="utf-8",
+    )
+
+    def sample(timestamp, wave, issued, reason, pc_offset, workgroup=(3, 0, 0)):
+        return {
+            "type": "sample",
+            "method": "stochastic",
+            "dispatch_id": 7,
+            "code_object_id": 2,
+            "pc_offset": pc_offset,
+            "timestamp": timestamp,
+            "exec_mask": 0xFFFFFFFF,
+            "workgroup_id": list(workgroup),
+            "hardware": {
+                "chiplet": 0,
+                "wave_slot": wave,
+                "simd_id": wave,
+                "cu_or_wgp_id": 4,
+                "shader_array_id": 0,
+                "shader_engine_id": 1,
+            },
+            "wave_in_group": wave,
+            "wave_issued": issued,
+            "instruction_type": "valu" if issued else "barrier",
+            "reason_not_issued": reason,
+            "arb_state": {},
+            "memory_counters": {},
+        }
+
+    raw_records = [
+        {"type": "schema", "schema": "proton-amd-pc-sampling", "version": 1},
+        sample(1000, 0, True, "arbiter_not_win", 16),
+        sample(1020, 1, False, "barrier_wait", 20),
+        sample(1040, 0, False, "waitcnt", 16, workgroup=(4, 0, 0)),
+        {"type": "dropped_samples", "count": 2},
+        {"type": "clock_info", "timestamp_unit": "ns", "timestamp_offset_ns": 100},
+        {
+            "type": "pc_info",
+            "dispatch_id": 7,
+            "code_object_id": 2,
+            "pc_offset": 16,
+            "kernel_name": "kernel",
+            "instruction": "v_add_f32 v0, v1, v2",
+            "source_file": "kernel.py",
+            "source_line": 10,
+            "source_function": "kernel",
+        },
+        {
+            "type": "pc_info",
+            "dispatch_id": 7,
+            "code_object_id": 2,
+            "pc_offset": 20,
+            "kernel_name": "kernel",
+            "instruction": "s_barrier_wait 0xffff",
+            "source_file": "kernel.py",
+            "source_line": 11,
+            "source_function": "kernel",
+        },
+    ]
+    config.raw_path.write_text("".join(json.dumps(record) + "\n" for record in raw_records), encoding="utf-8")
+
+    summary = merge_pc_sampling_chrome_trace(config)
+    assert summary["sample_events"] == 3
+    assert summary["counter_events"] == 3
+    assert summary["sample_states"] == {"issued": 1, "barrier_wait": 1, "waitcnt": 1}
+    assert summary["clock_alignment"] == "rocprofiler_timestamp_offset"
+
+    trace = json.loads(config.trace_path.read_text(encoding="utf-8"))
+    assert conventional_event in trace["traceEvents"]
+    sample_events = [event for event in trace["traceEvents"] if event.get("ph") == "i"]
+    counter_events = [event for event in trace["traceEvents"] if event.get("ph") == "C"]
+    assert [event["name"] for event in sample_events] == [
+        "issued: v_add_f32",
+        "barrier_wait: s_barrier_wait",
+        "waitcnt: v_add_f32",
+    ]
+    assert [event["ts"] for event in sample_events] == [0.0, 0.02, 0.04]
+    assert sample_events[0]["args"]["wave_in_group"] == 0
+    assert sample_events[1]["args"]["physical_location"] == "chiplet0/SE1/SA0/WGP4/SIMD1/slot1"
+    assert sample_events[0]["tid"] != sample_events[2]["tid"]
+    assert trace["pcSamplingMetadata"]["sample_events"] == 3
+    assert trace["pcSamplingMetadata"]["dropped_samples"] == 2
+    assert len(counter_events) == 3
+    assert all(set(event["args"]) == {"issued", "barrier_wait", "waitcnt"} for event in counter_events)
+
+
 def test_pcsampling(tmp_path: pathlib.Path, device: str):
     if not (is_cuda() or is_hip()):
         pytest.skip("Only CUDA and HIP backends support pc sampling")
@@ -998,13 +1118,17 @@ def test_pcsampling(tmp_path: pathlib.Path, device: str):
     assert expected_store_lines
 
     temp_file = tmp_path / "test_pcsampling.hatchet"
+    raw_file = tmp_path / "test_pcsampling.jsonl"
     backend = "cupti" if is_cuda() else "rocprofiler"
+    mode = "pcsampling"
+    if is_hip():
+        mode += f":raw_output={raw_file}"
     try:
         proton.start(
             str(temp_file.with_suffix("")),
             hook="triton",
             backend=backend,
-            mode="pcsampling",
+            mode=mode,
         )
     except RuntimeError as e:
         message = str(e)
@@ -1036,6 +1160,77 @@ def test_pcsampling(tmp_path: pathlib.Path, device: str):
         ]
         assert matching_source_frames
     assert total_samples(foo_frame) > 0
+
+    if is_hip():
+        assert raw_file.exists()
+        with raw_file.open() as f:
+            raw_records = [json.loads(line) for line in f if line.strip()]
+        assert raw_records[0] == {"type": "schema", "schema": "proton-amd-pc-sampling", "version": 1}
+        samples = [record for record in raw_records if record["type"] == "sample"]
+        pc_info = [record for record in raw_records if record["type"] == "pc_info"]
+        assert samples
+        assert pc_info
+        assert all(sample["workgroup_id"] is not None for sample in samples)
+        assert all(sample["wave_in_group"] is not None for sample in samples)
+        assert all(sample["hardware"] is not None for sample in samples)
+        assert all(sample["timestamp"] is not None for sample in samples)
+        sample_pcs = {(sample["dispatch_id"], sample["code_object_id"], sample["pc_offset"]) for sample in samples}
+        mapped_pcs = {(info["dispatch_id"], info["code_object_id"], info["pc_offset"]) for info in pc_info}
+        assert sample_pcs <= mapped_pcs
+        assert any(info["instruction"] for info in pc_info)
+        if expect_source_attribution:
+            assert any(info["source_file"] == str(pathlib.Path(__file__))
+                       and info["source_line"] in expected_store_lines and info["source_function"] for info in pc_info)
+
+
+def test_pcsampling_chrome_trace(tmp_path: pathlib.Path, device: str):
+    if not is_hip():
+        pytest.skip("Integrated PC-sampling Chrome traces require the AMD rocprofiler backend")
+    if os.environ.get("PROTON_SKIP_PC_SAMPLING_TEST", "0") == "1":
+        pytest.skip("PC sampling test is disabled")
+
+    @triton.jit
+    def foo(x, y, size: tl.constexpr):
+        offsets = tl.arange(0, size)
+        for _ in range(2000):
+            tl.store(y + offsets, tl.load(x + offsets))
+
+    profile_base = tmp_path / "test_pcsampling_trace"
+    try:
+        session = proton.start(
+            str(profile_base),
+            data="trace",
+            hook="triton",
+            backend="rocprofiler",
+            mode="pcsampling:format=chrome_trace:counter_bin_us=0",
+        )
+    except RuntimeError as error:
+        message = str(error)
+        unavailable = ("rocprofiler-sdk PC sampling service is not available" in message
+                       or "rocprofiler-sdk did not report PC sampling configurations" in message)
+        if unavailable:
+            proton.finalize()
+            pytest.skip(message)
+        raise
+
+    x = torch.ones((1024, ), device=device, dtype=torch.float32)
+    y = torch.zeros_like(x)
+    foo[(1, )](x, y, x.numel(), num_warps=4)
+    proton.finalize(session)
+
+    raw_path = profile_base.with_suffix(".pc_sampling.jsonl")
+    trace_path = profile_base.with_suffix(".chrome_trace")
+    assert raw_path.is_file()
+    assert trace_path.is_file()
+    with trace_path.open() as trace_file:
+        trace = json.load(trace_file)
+    assert any(event.get("cat") == "kernel" and event.get("name") == "foo" for event in trace["traceEvents"])
+    samples = [event for event in trace["traceEvents"] if str(event.get("cat", "")).startswith("pcsampling,")]
+    assert samples
+    assert all(event["ph"] == "i" for event in samples)
+    assert all("wave_in_group" in event["args"] and "pc" in event["args"] for event in samples)
+    assert trace["pcSamplingMetadata"]["sample_events"] == len(samples)
+    assert trace["pcSamplingMetadata"]["clock_alignment"] == "rocprofiler_timestamp_offset"
 
 
 def test_deactivate(tmp_path: pathlib.Path, device: str):

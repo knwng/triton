@@ -41,6 +41,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace proton {
@@ -1408,7 +1409,7 @@ void RocprofSDKProfiler::RocprofSDKProfilerPimpl::doFlush() {
   profiler.pendingGraphPool->flushAll();
   if (pcSamplingModeEnabled) {
     pcSampling.flushBuffers();
-    pcSampling.flushAccum();
+    pcSampling.flushAccum(profiler.timestampOffsetNs.value_or(0));
   }
 }
 
@@ -1493,6 +1494,55 @@ void RocprofSDKProfiler::doSetMode(
   auto *impl = static_cast<RocprofSDKProfilerPimpl *>(pImpl.get());
   impl->pcSamplingModeEnabled = proton::toLower(mode) == "pcsampling";
   if (impl->pcSamplingModeEnabled) {
+    std::string rawOutputPath;
+    bool aggregationEnabled = true;
+    bool aggregationOptionSeen = false;
+    for (size_t i = 1; i < modeAndOptions.size(); ++i) {
+      auto delimiterPos = modeAndOptions[i].find('=');
+      if (delimiterPos == std::string::npos) {
+        throw std::invalid_argument(
+            "RocprofSDKProfiler: malformed pcsampling option: " +
+            modeAndOptions[i]);
+      }
+      auto key = proton::toLower(modeAndOptions[i].substr(0, delimiterPos));
+      auto value = modeAndOptions[i].substr(delimiterPos + 1);
+      if (key == "aggregate") {
+        if (aggregationOptionSeen) {
+          throw std::invalid_argument(
+              "RocprofSDKProfiler: duplicate pcsampling aggregate option");
+        }
+        aggregationOptionSeen = true;
+        auto lowerValue = proton::toLower(value);
+        if (lowerValue == "true" || lowerValue == "1") {
+          aggregationEnabled = true;
+        } else if (lowerValue == "false" || lowerValue == "0") {
+          aggregationEnabled = false;
+        } else {
+          throw std::invalid_argument(
+              "RocprofSDKProfiler: pcsampling aggregate must be true or "
+              "false");
+        }
+        continue;
+      }
+      if (key != "raw_output") {
+        throw std::invalid_argument(
+            "RocprofSDKProfiler: unsupported pcsampling option key: " + key);
+      }
+      if (value.empty()) {
+        throw std::invalid_argument(
+            "RocprofSDKProfiler: pcsampling raw_output cannot be empty");
+      }
+      if (!rawOutputPath.empty()) {
+        throw std::invalid_argument(
+            "RocprofSDKProfiler: duplicate pcsampling raw_output option");
+      }
+      rawOutputPath = std::move(value);
+    }
+    if (!aggregationEnabled && rawOutputPath.empty()) {
+      throw std::invalid_argument(
+          "RocprofSDKProfiler: pcsampling aggregate=false requires "
+          "raw_output");
+    }
     impl->pcSampling.warnIfInvalidInterval();
     if (!impl->pcSampling.isConfigured()) {
       throw std::runtime_error(
@@ -1501,13 +1551,20 @@ void RocprofSDKProfiler::doSetMode(
           impl->pcSampling.configurationFailureReason());
     }
     impl->pcSampling.warnIfSourceLocationsUnavailable();
+    impl->pcSampling.setAggregationEnabled(aggregationEnabled);
+    impl->pcSampling.setRawOutputPath(rawOutputPath);
   } else if (proton::toLower(mode) == "periodic_flushing") {
+    impl->pcSampling.setAggregationEnabled(true);
+    impl->pcSampling.setRawOutputPath("");
     detail::setPeriodicFlushingMode(periodicFlushingEnabled,
                                     periodicFlushingFormat, modeAndOptions,
                                     "RocprofSDKProfiler");
   } else if (!mode.empty()) {
     throw std::invalid_argument("RocprofSDKProfiler: unsupported mode: " +
                                 mode);
+  } else {
+    impl->pcSampling.setAggregationEnabled(true);
+    impl->pcSampling.setRawOutputPath("");
   }
 }
 

@@ -1,15 +1,18 @@
 import functools
-import triton
-
-from triton._C.libproton import proton as libproton  # type: ignore
-from triton._C.libtriton import getenv  # type: ignore
-from .flags import flags
-from .hooks import HookManager, LaunchHook, InstrumentationHook
-from .hooks.hook import Hook
-from .mode import BaseMode
 from typing import Optional, Union
 
+import triton
+from triton._C.libproton import proton as libproton  # type: ignore
+from triton._C.libtriton import getenv  # type: ignore
+
+from ._pcsampling import PCSamplingTraceConfig, merge_pc_sampling_chrome_trace, prepare_pc_sampling_trace
+from .flags import flags
+from .hooks import HookManager, InstrumentationHook, LaunchHook
+from .hooks.hook import Hook
+from .mode import BaseMode
+
 DEFAULT_PROFILE_NAME = "proton"
+_pc_sampling_trace_sessions: dict[int, PCSamplingTraceConfig] = {}
 
 
 def _select_backend() -> str:
@@ -95,6 +98,14 @@ def start(
                                                For example, "periodic_flushing" mode has a knob:
                                                - format: The output format of the profiling results. Available options are ["hatchet", "hatchet_msgpack", "chrome_trace"]. Default is "hatchet".
                                                The can be set via `mode="periodic_flushing:format=chrome_trace"`.
+                                               AMD "pcsampling" supports `raw_output=<path>` to retain per-sample
+                                               workgroup, wave, hardware location, timestamp, PC, stall reason,
+                                               and memory-counter data as JSON Lines.
+                                               With `data="trace"`, use `format=chrome_trace` to merge those raw
+                                               samples into Proton's conventional Chrome trace. The raw JSONL is
+                                               written next to the trace and aggregate PC-sampling metrics are
+                                               disabled for this raw-only path. `counter_bin_us=<width>` controls
+                                               sampled-state counters and `0` disables them.
         hook (Union[str, Hook], optional): The hook to use for profiling.
                                            You may pass either:
                                            - a string hook name, e.g. "triton" (kernel launch metadata), or
@@ -113,10 +124,13 @@ def start(
     backend = _select_backend() if backend is None else backend
     # Convert mode to its string representation for libproton's runtime
     mode_str = _get_mode_str(backend, mode)
+    mode_str, pc_sampling_trace = prepare_pc_sampling_trace(name, data, backend, mode_str)
 
     _check_env(backend)
 
     session = libproton.start(name, context, data, backend, mode_str)
+    if pc_sampling_trace is not None:
+        _pc_sampling_trace_sessions[session] = pc_sampling_trace
 
     if isinstance(hook, Hook):
         HookManager.register(hook, session)
@@ -188,6 +202,14 @@ def finalize(session: Optional[int] = None, output_format: Optional[str] = "") -
     Returns:
         None
     """
+    if session is None:
+        pc_sampling_traces = list(_pc_sampling_trace_sessions.values())
+    else:
+        trace = _pc_sampling_trace_sessions.get(session)
+        pc_sampling_traces = [] if trace is None else [trace]
+    if pc_sampling_traces and output_format not in (None, "", "chrome_trace"):
+        raise ValueError("PC-sampling Chrome trace sessions must be finalized as chrome_trace")
+
     HookManager.unregister(session)
 
     if session is None:
@@ -197,6 +219,13 @@ def finalize(session: Optional[int] = None, output_format: Optional[str] = "") -
         if flags.command_line and session != 0:
             raise ValueError("Only one session can be finalized when running from the command line.")
         libproton.finalize(session, output_format)
+
+    if session is None:
+        _pc_sampling_trace_sessions.clear()
+    else:
+        _pc_sampling_trace_sessions.pop(session, None)
+    for trace in pc_sampling_traces:
+        merge_pc_sampling_chrome_trace(trace)
 
 
 def _profiling(

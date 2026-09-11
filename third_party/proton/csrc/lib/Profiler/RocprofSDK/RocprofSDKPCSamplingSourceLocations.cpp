@@ -122,8 +122,7 @@ void RocprofSDKPCSampling::recordCodeObjectUnload(uint64_t codeObjectId) {
   tryReleaseCodeObject(codeObjectId);
 }
 
-std::optional<RocprofSDKPCSampling::SourceLocation>
-RocprofSDKPCSampling::resolveSourceLocationLocked(
+RocprofSDKPCSampling::PCInfo RocprofSDKPCSampling::resolvePCInfoLocked(
     MetadataState &state, uint64_t codeObjectId, uint64_t pcOffset,
     const PCSamplingTarget &target) {
 #if !PROTON_ROCPROFILER_SDK_HAS_CODEOBJ_ADDRESS_TRANSLATE
@@ -131,25 +130,30 @@ RocprofSDKPCSampling::resolveSourceLocationLocked(
   (void)pcOffset;
   (void)target;
   if (codeObjectId == ROCPROFILER_CODE_OBJECT_ID_NONE)
-    return std::nullopt;
-  return std::nullopt;
+    return {};
+  return {};
 #else
   if (codeObjectId == ROCPROFILER_CODE_OBJECT_ID_NONE) {
-    return std::nullopt;
+    return {};
   }
 
   SourceLocationKey key{codeObjectId, pcOffset};
-  auto cached = state.sourceLocationCache.find(key);
-  if (cached != state.sourceLocationCache.end())
+  auto cached = state.pcInfoCache.find(key);
+  if (cached != state.pcInfoCache.end())
     return cached->second;
 
-  std::optional<SourceLocation> resolved;
+  PCInfo resolved;
   if (ensureSourceLocationDecoderLocked(state, codeObjectId) &&
       state.sourceLocationTranslator) {
     try {
       auto inst = state.sourceLocationTranslator->get(codeObjectId, pcOffset);
-      if (inst && !inst->comment.empty())
-        resolved = parseSourceLocationComment(inst->comment, target.kernelName);
+      if (inst) {
+        if (!inst->inst.empty())
+          resolved.instruction = inst->inst;
+        if (!inst->comment.empty())
+          resolved.sourceLocation =
+              parseSourceLocationComment(inst->comment, target.kernelName);
+      }
     } catch (const std::exception &error) {
       reportSourceLocationErrorLocked(
           state, codeObjectId, "resolving a sampled address", error.what());
@@ -158,7 +162,7 @@ RocprofSDKPCSampling::resolveSourceLocationLocked(
                                       "resolving a sampled address");
     }
   }
-  state.sourceLocationCache.insert_or_assign(key, resolved);
+  state.pcInfoCache.insert_or_assign(key, resolved);
   return resolved;
 #endif
 }
@@ -216,10 +220,9 @@ void RocprofSDKPCSampling::reportSourceLocationErrorLocked(
 
 void RocprofSDKPCSampling::clearSourceLocationCacheLocked(
     MetadataState &state, uint64_t codeObjectId) {
-  for (auto it = state.sourceLocationCache.begin();
-       it != state.sourceLocationCache.end();) {
+  for (auto it = state.pcInfoCache.begin(); it != state.pcInfoCache.end();) {
     if (it->first.codeObjectId == codeObjectId) {
-      it = state.sourceLocationCache.erase(it);
+      it = state.pcInfoCache.erase(it);
     } else {
       ++it;
     }

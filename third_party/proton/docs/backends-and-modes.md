@@ -51,6 +51,66 @@ integer sampling interval. The default is `131072`, and rocprofiler-sdk clamps
 the requested value to the supported range reported by the GPU. Smaller values
 can produce more samples and overhead; larger values reduce both.
 
+To retain individual AMD samples instead of only the aggregated Hatchet
+metrics, pass a raw JSON Lines output path in the mode string:
+
+```python
+proton.start(
+    "profile_name",
+    backend="rocprofiler",
+    mode="pcsampling:raw_output=/tmp/profile.pc_sampling.jsonl",
+)
+```
+
+The optional file contains one `sample` record per hardware sample and one
+`pc_info` record per unique dispatch and sampled PC. Sample records preserve
+the logical workgroup and wave, physical shader-engine/WGP/SIMD/wave-slot,
+timestamp, PC, issue state, stochastic stall reason, arbiter state, and memory
+counters when rocprofiler-sdk marks those fields as available. `pc_info`
+records map the dispatch and PC to the disassembled instruction, kernel, and
+source location. If rocprofiler-sdk reports buffer loss, a `dropped_samples`
+record preserves the number of missing samples. This mode can generate large
+files and adds callback-thread I/O overhead.
+
+To generate a conventional Proton Chrome trace augmented with every raw AMD PC
+sample, use trace data and enable the `chrome_trace` PC-sampling option:
+
+```python
+proton.start(
+    "profile_name",
+    data="trace",
+    backend="rocprofiler",
+    mode="pcsampling:format=chrome_trace",
+)
+```
+
+This writes both `profile_name.pc_sampling.jsonl` and
+`profile_name.chrome_trace`. The Chrome trace retains Proton's CPU scopes,
+kernel intervals, and launch flows, then adds one instant event per hardware
+sample on dispatch lanes, with a separate thread lane for each logical
+`(workgroup, wave_in_group)` pair. This distinction is important because the
+same wave index is reused by every workgroup. By default the trace also adds
+sampled-state counters in 20 microsecond bins. Set `counter_bin_us=0` to omit
+counters or use another non-negative width, for example:
+
+```python
+mode="pcsampling:format=chrome_trace:counter_bin_us=10"
+```
+
+The integrated Chrome-trace path is raw-only: Proton does not build aggregated
+`PCSamplingMetric` nodes while collecting it. This avoids retaining the same
+samples in both the raw and aggregated forms. Legacy `mode="pcsampling"`
+continues to aggregate into Hatchet for compatibility. An explicit raw-only
+capture without Chrome-trace merging can use:
+
+```python
+mode="pcsampling:raw_output=/tmp/profile.pc_sampling.jsonl:aggregate=false"
+```
+
+When timestamp-offset metadata is available, PC sample instants are aligned to
+the same clock domain as the conventional kernel events. PC samples remain
+statistical observations rather than instruction-duration intervals.
+
 By default, Proton prefers stochastic sampling and falls back to host-trap
 sampling. Set `PROTON_ROCPROFILER_PC_SAMPLING_METHOD` to `stochastic` or
 `host-trap` to require a specific method. Profiling fails to start if the
