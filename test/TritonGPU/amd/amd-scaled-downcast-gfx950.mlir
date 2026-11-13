@@ -76,6 +76,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.targ
     tt.return
   }
 
+  // Each thread converts its 32 values with one instruction (even values as
+  // the first source, odd values as the second) and expands the 6 result dwords
+  // into two 16-byte groups with 4 zero padding bytes each.
+  tt.func public @scaled_downcast_fp6_packed(
+      %input: tensor<1x2048xf32, #fp6>,
+      %scale: tensor<1x64xi8, #scale>,
+      %output: tensor<1x2048x!tt.ptr<i8>, #fp6>) {
+    // CHECK-LABEL: llvm.func @scaled_downcast_fp6_packed
+    // CHECK: rocdl.cvt.scalef32.2xpk16.bf6.f32 {{.*}} : vector<6xi32>
+    // CHECK-NOT: rocdl.cvt.scalef32.2xpk16
+    %result = amdg.scaled_downcast_fp6 %input scale %scale {axis = 1 : i32, format = 3 : i32} : tensor<1x2048xf32, #fp6>, tensor<1x64xi8, #scale> -> tensor<1x2048xi8, #fp6>
+    tt.store %output, %result : tensor<1x2048x!tt.ptr<i8>, #fp6>
+    tt.return
+  }
+
   // amdg.upcast_fp6 decodes each 16-value group from its 12 code bytes with
   // integer ops; the 4 padding bytes are not read.
   tt.func public @upcast_fp6(
